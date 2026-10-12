@@ -1,0 +1,22 @@
+# Local environment configuration and secret files
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Private keys, certificate bundles, and keystores
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Local secret mounts and credential exports
+secrets/
+credentials/
+*.secret
+*.credentials
+
+# Local Python virtual environment
+.pro001
