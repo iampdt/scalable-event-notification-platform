@@ -34,45 +34,45 @@ docs/api.md, docs/database.md, docs/architecture.md
 Done when: `alembic upgrade head` works on an empty DB and the seed script
 creates a tenant, an API key and 3 users.
 - [Done] Docker Compose with Postgres
-- [ ] Alembic set up
-- [ ] Migration for the tables above
-- [ ] Seed script
+- [Done] Alembic set up
+- [Done] Migration for the tables above
+- [Done] Seed script
 
 ### M2: Ingest endpoint
 Done when: `curl POST /v1/events` returns 202 and psql shows 1 event,
 N notifications, N x channels deliveries.
-- [ ] API key auth (derive tenant_id)
-- [ ] Request validation
-- [ ] Single-transaction fan-out
-- [ ] Return 202 only after commit
+- [Done] API key auth (derive tenant_id)
+- [Done] Request validation
+- [Done] Single-transaction fan-out
+- [Done] Return 202 only after commit
 
 ### M3: Idempotency + tenant isolation
 Done when: tests pass for same key + same body, same key + changed body (409),
 and tenant B reading tenant A's IDs (404).
-- [ ] Tests written first
-- [ ] Implementation
+- [Done] Tests written first
+- [Done] Implementation
 
 ### M4: Worker
 Done when: posting an event leads to `delivered` visible via GET.
-- [ ] Claim query with SKIP LOCKED
-- [ ] Fake provider
-- [ ] Completion transaction
-- [ ] Status endpoints
+- [Done] Claim query with SKIP LOCKED
+- [Done] Fake provider
+- [Done] Completion transaction
+- [Done] Status endpoints
 
 ### M5: Failure handling
 Done when: killing the worker mid-send results in attempt 2 of the SAME delivery,
 and two workers never claim the same row.
-- [ ] delivery_attempts written
-- [ ] Backoff + retryable vs permanent errors
-- [ ] Lease reclaim test
-- [ ] Two-worker test
+- [Done] delivery_attempts written
+- [Done] Backoff + retryable vs permanent errors
+- [Done] Lease reclaim test
+- [Done] Two-worker test
 
 ### M6: Real channels (later)
 ### M7: Load test and metrics (later)
 ### M8: README and diagram (later)
 
 ## Current focus
-M1. Next task: ______
+M6 (deferred). Next task: choose a real delivery channel or continue with V1.x administration endpoints.
 
 ## Open questions
 - (anything you're unsure about goes here, one line each)

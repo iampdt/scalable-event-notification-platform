@@ -5,24 +5,26 @@ Revises:
 Create Date: 2026-10-12 23:46:35.111605
 
 """
-from typing import Sequence, Union
-
 from alembic import op
-import sqlalchemy as sa
+from app.db import models  # noqa: F401 - registers all migration metadata
+from app.db.base import Base
 
 
 # revision identifiers, used by Alembic.
-revision: str = '88f6efa44e81'
-down_revision: Union[str, None] = None
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+revision = "88f6efa44e81"
+down_revision = None
+branch_labels = None
+depends_on = None
 
 
 def upgrade() -> None:
-    """Upgrade schema."""
-    pass
+    """Create the V1 tenant, event, delivery, and attempt tables."""
+    op.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+    # Metadata is intentionally invoked only by this versioned Alembic migration;
+    # application startup never creates or alters schema.
+    Base.metadata.create_all(bind=op.get_bind(), checkfirst=True)
 
 
 def downgrade() -> None:
-    """Downgrade schema."""
-    pass
+    """Remove the V1 schema in dependency order."""
+    Base.metadata.drop_all(bind=op.get_bind(), checkfirst=True)

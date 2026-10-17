@@ -1,0 +1,1 @@
+"""Local delivery provider adapters."""
