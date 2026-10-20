@@ -19,7 +19,8 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, insert, text, update
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
-from app import circuit
+from app import circuit, metrics
+from app.logging_config import configure_logging
 from app.config import dispatch_mode, email_provider_name, webhook_timeout_seconds
 from app.db.models import Delivery, DeliveryAttempt, DeliveryChannel, DeliveryStatus, OutboxMessage
 from app.messaging import delivery_message
@@ -74,7 +75,7 @@ FAIL_ABANDONED_SQL = text(
         last_error_code = 'worker_lost', updated_at = now()
     FROM abandoned
     WHERE d.id = abandoned.id
-    RETURNING d.id
+    RETURNING d.id, d.channel
     """
 )
 CLAIM_DUE_SQL = text(CLAIM_TEMPLATE.format(status="pending", due_column="next_attempt_at", comparison="<=", extra=""))
@@ -166,10 +167,13 @@ class DeliveryWorker:
             abandoned = session.execute(FAIL_ABANDONED_SQL, params).all()
             if abandoned:
                 logger.error("abandoned_deliveries_failed count=%s ids=%s", len(abandoned), [str(row.id) for row in abandoned])
+                for row in abandoned:
+                    metrics.DELIVERIES_DEAD_LETTERED.labels(str(row.channel), "worker_lost").inc()
             # Crashed workers' rows first; they have already waited a full lease.
             reclaimed = [row.id for row in session.execute(RECLAIM_EXPIRED_SQL, params)]
             if reclaimed:
                 self.reclaimed_total += len(reclaimed)
+                metrics.LEASES_RECLAIMED.inc(len(reclaimed))
                 logger.warning("reclaimed_expired_leases count=%s", len(reclaimed))
             due = [row.id for row in session.execute(CLAIM_DUE_SQL, {**params, "limit": batch_size - len(reclaimed)})] if len(reclaimed) < batch_size else []
             ids = reclaimed + due
@@ -285,7 +289,9 @@ class DeliveryWorker:
             return []
         try:
             with SessionLocal.begin() as session:
-                return [self._apply(session, outcome) for outcome in outcomes]
+                results = [self._apply(session, outcome) for outcome in outcomes]
+            self._record_committed(outcomes, results)
+            return results
         except SQLAlchemyError:
             logger.exception("batch_completion_failed size=%s; retrying one by one", len(outcomes))
         results = []
@@ -297,7 +303,21 @@ class DeliveryWorker:
                 # Left in processing; lease expiry will hand it to another attempt.
                 logger.exception("completion_failed delivery_id=%s", outcome.claimed.id)
                 results.append(False)
+        self._record_committed(outcomes, results)
         return results
+
+    @staticmethod
+    def _record_committed(outcomes: list[Outcome], results: list[bool]) -> None:
+        """Metrics for state that is now committed (so a rolled-back batch that is
+        re-applied row by row is not counted twice)."""
+        for outcome, applied in zip(outcomes, results):
+            if not applied:
+                if outcome.deferred_seconds is None:
+                    metrics.STALE_COMPLETIONS.inc()
+                continue
+            failure, claimed = outcome.failure, outcome.claimed
+            if failure is not None and not (failure.retryable and claimed.attempt_count < claimed.max_attempts):
+                metrics.DELIVERIES_DEAD_LETTERED.labels(claimed.channel.value, "exhausted" if failure.retryable else "permanent").inc()
 
     def complete_success(self, claimed: ClaimedDelivery, started_at: datetime | None = None, status_code: int | None = None) -> bool:
         now = datetime.now(timezone.utc)
@@ -320,26 +340,37 @@ class DeliveryWorker:
         started_at = datetime.now(timezone.utc)
         scope = self.circuit_scope(claimed)
         permit = circuit.before(scope) if scope else circuit.ALLOW
+        channel = claimed.channel.value
         if not permit.allowed:
+            metrics.DELIVERIES_DEFERRED.labels(channel).inc()
             # Jitter spreads the deferred deliveries so they don't all return at
             # the instant the circuit half-opens.
             return Outcome(claimed, started_at, started_at, deferred_seconds=permit.retry_after_seconds + random.uniform(0, 5))
+        timer = time.perf_counter()
         try:
             status_code = self.providers[claimed.channel].send(claimed)
             outcome = Outcome(claimed, started_at, datetime.now(timezone.utc), status_code=status_code)
             healthy = True
+            metrics.DELIVERY_ATTEMPTS.labels(channel, "success").inc()
+            if claimed.occurred_at:
+                metrics.END_TO_END.labels(channel).observe((outcome.completed_at - claimed.occurred_at).total_seconds())
         except ProviderFailure as failure:
             outcome = Outcome(claimed, started_at, datetime.now(timezone.utc), failure=failure)
             # Only "is the target up?" failures count; a 4xx means it answered.
             healthy = not failure.retryable
+            metrics.DELIVERY_ATTEMPTS.labels(channel, "retryable_failure" if failure.retryable else "permanent_failure").inc()
         except Exception:
             # Bugs or unexpected library errors: retry rather than lose the message,
             # and keep the exception detail in logs rather than in the attempt row.
-            logger.exception("provider_crashed delivery_id=%s channel=%s", claimed.id, claimed.channel.value)
+            logger.exception("provider_crashed delivery_id=%s channel=%s", claimed.id, channel)
+            metrics.DELIVERY_ATTEMPTS.labels(channel, "provider_error").inc()
             return Outcome(claimed, started_at, datetime.now(timezone.utc), failure=ProviderFailure("internal provider error", retryable=True))
+        finally:
+            metrics.PROVIDER_DURATION.labels(channel).observe(time.perf_counter() - timer)
         if scope:
             transition = circuit.after(scope, permit, healthy)
             if transition:
+                metrics.CIRCUIT_TRANSITIONS.labels(channel, transition).inc()
                 logger.warning("circuit_%s scope=%s", transition, scope)
         return outcome
 
@@ -348,12 +379,14 @@ class DeliveryWorker:
 
     def process_ids(self, ids: list[uuid.UUID], executor: ThreadPoolExecutor | None = None) -> int:
         """Kafka mode: claim, send, and record the deliveries named by a consumed batch."""
-        return self._process(self.claim_ids(ids), executor)
+        return self._process(self.claim_ids(ids), executor, mode="kafka")
 
     def run_once(self, batch_size: int = 10, executor: ThreadPoolExecutor | None = None) -> int:
-        return self._process(self.claim(batch_size), executor)
+        return self._process(self.claim(batch_size), executor, mode="poll")
 
-    def _process(self, claimed: list[ClaimedDelivery], executor: ThreadPoolExecutor | None) -> int:
+    def _process(self, claimed: list[ClaimedDelivery], executor: ThreadPoolExecutor | None, mode: str = "poll") -> int:
+        if claimed:
+            metrics.BATCH_SIZE.labels(mode).observe(len(claimed))
         if executor is None or len(claimed) <= 1:
             outcomes = [self.attempt(delivery) for delivery in claimed]
         else:
@@ -406,7 +439,8 @@ def main() -> None:
     parser.add_argument("--lease-seconds", type=int, default=60)
     parser.add_argument("--poll-seconds", type=float, default=1.0)
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    configure_logging("delivery-worker")
+    metrics.start_worker_metrics_server()
 
     worker = DeliveryWorker(lease_seconds=args.lease_seconds, concurrency=args.concurrency)
     worker.check_lease_budget(args.batch_size)

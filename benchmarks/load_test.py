@@ -46,9 +46,9 @@ def percentile(values: list[float], pct: float) -> float:
     return ordered[min(len(ordered) - 1, int(round(pct / 100 * (len(ordered) - 1))))]
 
 
-async def ingest(base_url: str, token: str, user_ids: list[str], channels: list[str], events: int, concurrency: int) -> tuple[list[float], dict[int, int], float]:
+async def ingest(base_url: str, token: str, user_ids: list[str], channels: list[str], events: int, concurrency: int, first_index: int = 0) -> tuple[list[float], dict, float]:
     latencies: list[float] = []
-    statuses: dict[int, int] = {}
+    statuses: dict = {}
     semaphore = asyncio.Semaphore(concurrency)
     recipients = [{"user_id": user_id, "channels": channels} for user_id in user_ids]
 
@@ -58,13 +58,47 @@ async def ingest(base_url: str, token: str, user_ids: list[str], channels: list[
             headers = {"Authorization": f"Bearer {token}", "Idempotency-Key": f"load-{index}"}
             async with semaphore:
                 started = time.perf_counter()
-                response = await client.post("/v1/events", json=body, headers=headers)
+                try:
+                    response = await client.post("/v1/events", json=body, headers=headers)
+                    status = response.status_code
+                except httpx.HTTPError as exc:  # count transport errors; don't crash the run
+                    status = f"error:{type(exc).__name__}"
                 latencies.append((time.perf_counter() - started) * 1000)
-                statuses[response.status_code] = statuses.get(response.status_code, 0) + 1
+                statuses[status] = statuses.get(status, 0) + 1
 
         started = time.perf_counter()
-        await asyncio.gather(*(one(i) for i in range(events)))
+        await asyncio.gather(*(one(i) for i in range(first_index, first_index + events)))
         return latencies, statuses, time.perf_counter() - started
+
+
+def _ingest_in_process(args: tuple) -> tuple[list[float], dict, float]:
+    return asyncio.run(ingest(*args))
+
+
+def ingest_parallel(base_url: str, token: str, user_ids: list[str], channels: list[str], events: int, concurrency: int, processes: int) -> tuple[list[float], dict, float]:
+    """Split the load across processes. One asyncio+httpx process tops out around
+    100-200 requests/s on a laptop (measured: it held only 12 of 40 connections
+    open), so beyond that a single generator measures itself, not the API."""
+    if processes <= 1:
+        return asyncio.run(ingest(base_url, token, user_ids, channels, events, concurrency))
+    from concurrent.futures import ProcessPoolExecutor
+
+    share, extra = divmod(events, processes)
+    jobs, first = [], 0
+    for index in range(processes):
+        count = share + (1 if index < extra else 0)
+        jobs.append((base_url, token, user_ids, channels, count, max(1, concurrency // processes), first))
+        first += count
+    started = time.perf_counter()
+    with ProcessPoolExecutor(processes) as pool:
+        results = list(pool.map(_ingest_in_process, jobs))
+    elapsed = time.perf_counter() - started
+    latencies = [value for result in results for value in result[0]]
+    statuses: dict = {}
+    for result in results:
+        for status, count in result[1].items():
+            statuses[status] = statuses.get(status, 0) + count
+    return latencies, statuses, elapsed
 
 
 def spawn_workers(count: int, batch_size: int, dispatch: str = "postgres") -> list[subprocess.Popen]:
@@ -100,6 +134,8 @@ def main() -> None:
     parser.add_argument("--worker-batch", type=int, default=10)
     parser.add_argument("--start-workers-first", action="store_true", help="measure steady-state lag instead of backlog drain")
     parser.add_argument("--dispatch", choices=["postgres", "kafka"], default="postgres", help="must match the API's DISPATCH_MODE")
+    parser.add_argument("--processes", type=int, default=1, help="load-generator processes (concurrency is split between them)")
+    parser.add_argument("--ingest-only", action="store_true", help="measure the API only; don't wait for delivery")
     parser.add_argument("--rate-limit", type=float, help="give the tenant this events/s limit (burst = same) and report how the limiter behaves")
     args = parser.parse_args()
 
@@ -107,7 +143,10 @@ def main() -> None:
     channels = args.channels.split(",")
     workers = spawn_workers(args.workers, args.worker_batch, args.dispatch) if args.start_workers_first else []
     try:
-        latencies, statuses, elapsed = asyncio.run(ingest(args.base_url, token, user_ids, channels, args.events, args.concurrency))
+        latencies, statuses, elapsed = ingest_parallel(args.base_url, token, user_ids, channels, args.events, args.concurrency, args.processes)
+        if args.ingest_only:
+            print(json.dumps({"events": args.events, "concurrency": args.concurrency, "statuses": statuses, "seconds": round(elapsed, 2), "events_per_second": round(args.events / elapsed, 1), "latency_ms": {"p50": round(percentile(latencies, 50), 1), "p95": round(percentile(latencies, 95), 1), "p99": round(percentile(latencies, 99), 1)}}))
+            return
         if args.rate_limit:
             accepted = statuses.get(202, 0)
             print(json.dumps({"rate_limit": args.rate_limit, "seconds": round(elapsed, 2), "statuses": statuses, "accepted_per_second": round(accepted / elapsed, 1), "expected_max": round(args.rate_limit + args.rate_limit / elapsed, 1)}))

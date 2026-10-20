@@ -54,6 +54,10 @@ flowchart LR
   matched Postgres polling on latency and did *not* add throughput, because the
   ceiling is database state writes. Its value here is push instead of polling,
   replay, buffering, and room for more consumers.
+- **Observable:** Prometheus metrics (RED, queue saturation, consumer lag,
+  per-cache hit rate), 10 alert rules, a Grafana dashboard generated as code,
+  and JSON logs keyed by `request_id`. Metrics were cross-checked against SQL
+  ground truth.
 - **Templates:** tenant-authored, logic-free `{{ payload.field }}` templates for
   email and in-app, rendered at ingestion, so a missing field is a `422` for the
   producer instead of a broken email later.
@@ -69,6 +73,7 @@ flowchart LR
 | --- | --- |
 | [docs/benchmarks.md](docs/benchmarks.md) | Load-test method, results, and the bottleneck investigation |
 | [docs/failure-experiments.md](docs/failure-experiments.md) | What happens when each dependency or component fails, tested live |
+| [docs/observability.md](docs/observability.md) | Metrics catalog, dashboard, alerts, logs, and a short runbook |
 | [docs/architecture.md](docs/architecture.md) | Requirements, lifecycle, reliability model, roadmap |
 | [docs/database.md](docs/database.md) | Schema, indexes, transactions, claim/completion SQL |
 | [docs/api.md](docs/api.md) | HTTP contract and error model |
@@ -79,7 +84,8 @@ flowchart LR
 **Everything in Docker:**
 
 ```sh
-docker compose up -d --build              # Postgres, Redis, Kafka, Mailpit, migrations, topics, API :8000, relay, consumer
+docker compose up -d --build              # Postgres, Redis, Kafka, Mailpit, migrations, topics, API :8000, relay, consumer,
+                                          # Prometheus :9090, Grafana :3000 (dashboard: "Notification Platform")
 docker compose run --rm api python -m app.scripts.seed   # prints producer + admin keys ONCE
 docker compose logs -f worker
 ```
@@ -150,7 +156,7 @@ TEST_DATABASE_URL=postgresql+psycopg://notification_app:local_dev_password@local
   .venv/bin/pytest -q
 ```
 
-There are 128 tests. Provider and retry unit tests run without a database; the
+There are 137 tests. Provider and retry unit tests run without a database; the
 integration tests (idempotency races, tenant isolation, leases, fencing, retries,
 webhooks, feed) are skipped unless `TEST_DATABASE_URL` is set. CI also checks the
 migration chain from scratch and that the models match it (`alembic check`).

@@ -14,6 +14,7 @@ from app.api.errors import ApiError
 from app.api.schemas import IngestEvent
 from app.db.models import Delivery, DeliveryChannel, DeliveryStatus, Event, Notification, NotificationTemplate, OutboxMessage, User, WebhookEndpoint
 from app.messaging import delivery_message
+from app.metrics import CACHE_REQUESTS, DELIVERIES_PLANNED, EVENTS_INGESTED
 from app.cache import get_cache
 from app.config import cache_ttl_seconds, dispatch_mode
 from app.notifications.templates import TemplateError, render
@@ -76,7 +77,9 @@ def active_templates(session: Session, tenant_id: uuid.UUID, event_type: str) ->
     key = templates_cache_key(tenant_id, event_type)
     cached = cache.get_json(key)
     if cached is not None:
+        CACHE_REQUESTS.labels("templates", "hit").inc()
         return {channel: TemplateSnapshot(**value) for channel, value in cached.items()}
+    CACHE_REQUESTS.labels("templates", "miss" if cache.enabled else "bypass").inc()
     rows = session.scalars(
         select(NotificationTemplate).where(NotificationTemplate.tenant_id == tenant_id, NotificationTemplate.event_type == event_type, NotificationTemplate.active.is_(True))
     )
@@ -106,6 +109,14 @@ def render_content(template: TemplateSnapshot, body: IngestEvent, user: User) ->
 
 
 def ingest(session: Session, tenant_id: uuid.UUID, idempotency_key: str, body: IngestEvent) -> dict:
+    try:
+        return _ingest(session, tenant_id, idempotency_key, body)
+    except ApiError as exc:
+        EVENTS_INGESTED.labels("conflict" if exc.status_code == 409 else "rejected").inc()
+        raise
+
+
+def _ingest(session: Session, tenant_id: uuid.UUID, idempotency_key: str, body: IngestEvent) -> dict:
     request_hash = normalized_hash(body)
     created: Event | None = None
     try:
@@ -114,6 +125,7 @@ def ingest(session: Session, tenant_id: uuid.UUID, idempotency_key: str, body: I
             if existing:
                 if existing.request_hash != request_hash:
                     raise ApiError(409, "idempotency_conflict", "Idempotency-Key was already used with different content.")
+                EVENTS_INGESTED.labels("replayed").inc()
                 return replay_summary(session, tenant_id, existing)
 
             requested_ids = [recipient.user_id for recipient in body.recipients]
@@ -155,6 +167,9 @@ def ingest(session: Session, tenant_id: uuid.UUID, idempotency_key: str, body: I
                 if messages:
                     session.execute(insert(OutboxMessage), messages)
         assert created is not None
+        EVENTS_INGESTED.labels("accepted").inc()
+        for delivery in deliveries:  # counted after commit: rolled-back plans never show up
+            DELIVERIES_PLANNED.labels(delivery.channel.value, delivery.status.value).inc()
         return event_summary(created, len(notifications), len(deliveries))
     except IntegrityError:
         # Two requests with the same key raced past the SELECT above; the unique
@@ -165,4 +180,5 @@ def ingest(session: Session, tenant_id: uuid.UUID, idempotency_key: str, body: I
             raise
         if existing.request_hash != request_hash:
             raise ApiError(409, "idempotency_conflict", "Idempotency-Key was already used with different content.")
+        EVENTS_INGESTED.labels("replayed").inc()
         return replay_summary(session, tenant_id, existing)

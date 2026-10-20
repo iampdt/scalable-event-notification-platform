@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
-from fastapi import Depends
+from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
@@ -28,6 +28,7 @@ from app.cache import get_cache
 from app.config import cache_ttl_seconds
 from app.db.models import ApiKey, ApiKeyRole, Tenant
 from app.db.session import get_session
+from app.metrics import CACHE_REQUESTS, RATE_LIMITED
 from app.security import token_parts, verify_secret
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -60,7 +61,9 @@ def load_credential(session: Session, prefix: str) -> dict | None:
     cache = get_cache()
     cached = cache.get_json(credential_cache_key(prefix))
     if cached is not None:
+        CACHE_REQUESTS.labels("credentials", "hit").inc()
         return cached
+    CACHE_REQUESTS.labels("credentials", "miss" if cache.enabled else "bypass").inc()
     # One join instead of separate key and tenant lookups. Unknown prefixes are
     # not cached (no negative caching): random-prefix spraying would only fill
     # Redis, and the indexed prefix lookup is cheap.
@@ -98,6 +101,7 @@ def touch_last_used(session: Session, record: dict, now: datetime) -> None:
 
 
 def authenticated_key(
+    request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)] = None,
     session: Session = Depends(get_session),
 ) -> Principal:
@@ -119,6 +123,7 @@ def authenticated_key(
     touch_last_used(session, record, now)
     if session.in_transaction():
         session.commit()  # end the auth transaction before the route begins its own
+    request.state.tenant_id = record["tenant_id"]  # for the access log (logs, not metric labels)
     return Principal(
         api_key_id=uuid.UUID(record["api_key_id"]),
         tenant_id=uuid.UUID(record["tenant_id"]),
@@ -139,6 +144,7 @@ def rate_limited_key(key: Principal = Depends(authenticated_key)) -> Principal:
     """Per-tenant ingestion limit, so one tenant cannot fill the shared queue."""
     decision = ratelimit.check(key.tenant_id, key.rate_limit_per_second, key.rate_limit_burst)
     if not decision.allowed:
+        RATE_LIMITED.inc()
         retry_after = max(1, int(decision.retry_after_seconds + 0.999))
         raise ApiError(429, "rate_limited", f"Tenant ingestion rate limit exceeded; retry after {retry_after}s.", headers={"Retry-After": str(retry_after)})
     return key

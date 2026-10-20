@@ -1,0 +1,77 @@
+# Alert rules evaluated by Prometheus (no Alertmanager locally: see them firing
+# at http://localhost:9090/alerts). Each maps to a failure mode in
+# docs/failure-experiments.md.
+groups:
+  - name: notification-platform
+    rules:
+      - alert: TargetDown
+        expr: up == 0
+        for: 1m
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $labels.job }} target {{ $labels.instance }} is down"
+
+      - alert: ApiErrorRateHigh
+        expr: |
+          (sum(rate(http_requests_total{status=~"5.."}[5m])) or vector(0))
+            / clamp_min(sum(rate(http_requests_total[5m])), 1e-9) > 0.05
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "More than 5% of API requests are failing (5xx)"
+
+      - alert: IngestLatencyAboveTarget
+        # The architecture target: p95 acknowledgement below 250 ms.
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{method="POST", route="/v1/events"}[5m]))) > 0.25
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "POST /v1/events p95 is above 250 ms"
+
+      - alert: DeliveryBacklogStale
+        # Workers down or not keeping up: due work is waiting.
+        expr: deliveries_oldest_due_seconds > 60
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          summary: "Oldest due delivery has waited {{ $value | humanizeDuration }}"
+
+      - alert: DeadLettersGrowing
+        expr: sum(increase(deliveries_dead_lettered_total[15m])) > 10
+        labels: {severity: ticket}
+        annotations:
+          summary: "{{ $value }} deliveries reached the dead-letter queue in 15 min"
+
+      - alert: CircuitOpened
+        expr: sum by (channel) (increase(circuit_transitions_total{transition="opened"}[10m])) > 0
+        labels: {severity: info}
+        annotations:
+          summary: "A {{ $labels.channel }} circuit breaker opened (a target is down)"
+
+      - alert: OutboxNotDraining
+        expr: outbox_oldest_due_seconds > 60 or outbox_failing_rows > 0
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "Outbox is not publishing to Kafka"
+
+      - alert: KafkaConsumerLagHigh
+        expr: sum(kafka_consumer_lag) > 1000
+        for: 5m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Kafka consumers are {{ $value }} messages behind"
+
+      - alert: RedisUnavailable
+        expr: sum(increase(redis_unavailable_total[5m])) > 0
+        labels: {severity: info}
+        annotations:
+          summary: "Redis unavailable: running without cache and rate limits"
+
+      - alert: QueueMetricsUnavailable
+        expr: queue_metrics_up == 0
+        for: 1m
+        labels: {severity: page}
+        annotations:
+          summary: "API cannot read queue state from PostgreSQL"

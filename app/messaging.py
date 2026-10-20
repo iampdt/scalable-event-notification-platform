@@ -95,3 +95,22 @@ def delivery_message(delivery_id: uuid.UUID, tenant_id: uuid.UUID, available_at=
 
 def parse_delivery_message(value: bytes) -> uuid.UUID:
     return uuid.UUID(json.loads(value)["delivery_id"])
+
+
+def group_lag(client, timeout: float = 5.0) -> dict[int, int]:
+    """Consumer-group lag per partition (log-end minus committed), measured from
+    *outside* the consumers: `client` is a Consumer with the group's id that never
+    subscribes. Self-reported lag disappears when every consumer is dead, which
+    is exactly when it matters, so this runs in the relay and the stats script.
+    """
+    from confluent_kafka import TopicPartition
+
+    topic = delivery_topic()
+    metadata = client.list_topics(topic, timeout=timeout)
+    partitions = [TopicPartition(topic, p) for p in metadata.topics[topic].partitions]
+    lag = {}
+    for tp in client.committed(partitions, timeout=timeout):
+        low, high = client.get_watermark_offsets(tp, timeout=timeout, cached=False)
+        committed = tp.offset if tp.offset >= 0 else low
+        lag[tp.partition] = max(high - committed, 0)
+    return lag

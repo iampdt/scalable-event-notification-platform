@@ -39,6 +39,9 @@ class Cache:
             already_down = time.monotonic() < self._down_until
             self._down_until = time.monotonic() + COOL_OFF_SECONDS
         if not already_down:
+            from app.metrics import REDIS_UNAVAILABLE
+
+            REDIS_UNAVAILABLE.inc()
             logger.warning("redis_unavailable operation=%s error=%s; bypassing for %ss", operation, type(exc).__name__, COOL_OFF_SECONDS)
 
     def call(self, operation: str, fn, default=None):

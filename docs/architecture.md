@@ -163,6 +163,10 @@ as a provider idempotency key when supported and as
   while `/healthz` (liveness) stays green; workers back off in-process rather than
   crash-looping.
 - Every failure mode, with live experiments: [failure-experiments.md](failure-experiments.md).
+- **Observability:** Prometheus metrics (RED for the API; queue, outbox, lag and
+  dead-letter saturation; per-cache hit rate), ten alert rules, a Grafana
+  dashboard generated as code, and JSON logs keyed by `request_id`. See
+  [observability.md](observability.md).
 
 ## Tenant boundary and modules
 

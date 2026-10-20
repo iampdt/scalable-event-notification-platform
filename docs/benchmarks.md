@@ -198,6 +198,66 @@ and backed off, and the consumer's partitions were revoked. After
 `docker compose start kafka`: partitions reassigned, outbox drained,
 `delivered=40 pending=0`.
 
+## Observability and scale experiments (plan step 5)
+
+Measured on 2026-10-21 with Prometheus scraping every 5 s.
+
+### Metrics cross-checked against ground truth
+
+1,500 events × 3 recipients × 2 channels through the Docker stack:
+
+| Measure | Load test / SQL | Prometheus | Verdict |
+| --- | --- | --- | --- |
+| Events accepted | 1,500 | 1,506 | `increase()` extrapolates to the window edges (expected) |
+| Delivery attempts | 9,000 | 9,178 | same |
+| Ingest p95 | 238.8 ms | 241 ms | ✓ |
+| End-to-end p95, first bucket layout | 11.0 s | **28.35 s** | ✗ buckets jumped 10 s → 30 s |
+| End-to-end p50 / p95 / p99, dense buckets | 14.1 / 19.44 / 19.6 s | 13.9 / 19.33 / 19.87 s | ✓ |
+
+**Lesson:** a histogram quantile is only as precise as the buckets around it.
+Put dense buckets where your SLO lives.
+
+### The load generator was the bottleneck
+
+All earlier "API throughput" numbers were really load-generator numbers. With
+40 configured connections, a single asyncio+httpx process held only **12** open.
+Against a 4-process API:
+
+| Generator processes | Throughput | p95 |
+| --- | --- | --- |
+| 1 | 129 ev/s | 854 ms |
+| 2 | 195 ev/s | 427 ms |
+| 4 | 203 ev/s | 312 ms |
+
+`load_test.py --processes N` now splits the load.
+
+### API horizontal scaling (`uvicorn --workers N`)
+
+3,000 events × 3 recipients × 2 channels, concurrency 40, 4 generator processes,
+ingest only, two runs each:
+
+| API processes | Throughput | p50 | p95 |
+| --- | --- | --- | --- |
+| 1 | 138–155 ev/s | 237–257 ms | 342–446 ms |
+| 2 | 179–180 ev/s | 188–193 ms | 344–350 ms |
+| 4 | **213–229 ev/s** | 142–151 ms | 292–375 ms |
+
+About 1.5× for 4× the processes. During the 4-process run the host had **0.1–0.3%
+idle CPU**: API processes about 277%, PostgreSQL about 196% (in the Docker VM, 35%
+system time), and the rest the load generators. The API scales horizontally; the
+limit here is that generator, API and database all share one 8-core laptop. A
+real scaling curve needs them on separate hosts.
+
+Connections were spread evenly across the four API processes (4/3/3/2 sampled),
+so uneven `accept()` distribution, a suspect on macOS, was ruled out.
+
+### Consumer lag with every consumer down
+
+`docker compose stop worker`, then 300 events (1,800 deliveries). The
+relay-measured `sum(kafka_consumer_lag)` read 0 → **1,800** (held) → after a restart
+1,250 → 0 within 20 s. A lag metric reported by the consumers themselves would
+have disappeared the moment they stopped.
+
 ## Reproducing
 
 Numbers vary by about ±20% between runs on a laptop (other processes, Docker VM
