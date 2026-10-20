@@ -150,8 +150,21 @@ user sees, what gets retried, where the message goes, and how it recovers.
 - [Done] Live experiments: Postgres down, worker SIGKILL, malformed message (plus Redis and Kafka from earlier steps)
 - [Done] docs/failure-experiments.md
 
+### Plan alignment, step 5 (observability and scale experiments)
+Done when: a reproducible benchmark, real numbers, an identified bottleneck,
+an architectural change, a before/after comparison, and the system observable
+through metrics, logs and dashboards.
+- [Done] Prometheus metrics: API RED, ingestion, worker attempts and latency, dead letters, deferrals, circuits, Kafka, per-cache hit rate
+- [Done] Queue, outbox and dead-letter gauges from Postgres at scrape time; consumer lag measured externally by the relay
+- [Done] JSON logs with request_id contextvar and access lines carrying tenant_id
+- [Done] Prometheus + Grafana in Compose; 10 alert rules (promtool-validated); dashboard as code (23 panels, all 31 queries verified live)
+- [Done] Bugs found by checking metrics against ground truth: coarse histogram buckets (p95 28 s vs 11 s), absent series invisible to `increase()`, empty 5xx ratio, consumer lag invisible when idle or dead
+- [Done] Load generator found to be the bottleneck (12 of 40 connections); multi-process generator
+- [Done] API horizontal scaling 1/2/4 processes (138–155 → 213–229 ev/s; host CPU saturated); multiprocess metrics verified
+- [Not done] Observability screenshots for the README (needs a browser capture: open Grafana during a load test)
+
 ## Current focus
-Next from the plan: step 5, observability and scale (structured logs, Prometheus metrics including per-cache hit rate and consumer lag, Grafana dashboard).
+Next from the plan: step 6, portfolio polish (deployment instructions, demo GIF/screenshots, public engineering write-up, interview prep at 30 s / 2 min / 10 min / 30 min).
 Other candidate next steps, in priority order:
 1. Per-cache hit/miss metrics (Redis's server-wide hit rate mixes cache and limiter keys)
 2. Retention: time-partition `events`/`deliveries`/`delivery_attempts`
