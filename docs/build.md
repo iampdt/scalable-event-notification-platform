@@ -99,8 +99,22 @@ p50/p95/p99, retry and failure rates, and the bottleneck is identified.
 - [Done] README with architecture diagram, quickstart, end-to-end demo
 - [Done] CI: fresh migrate, downgrade/upgrade, `alembic check`, pytest against Postgres
 
+### Plan alignment, step 1 (templates, Docker, auth tests)
+Done when: a tenant can register templates and events render through them;
+the API, worker, and migrations run with `docker compose up`; auth failures and
+schema invariants have tests.
+- [Done] `notification_templates` + `deliveries.content` migration
+- [Done] Logic-free `{{ path }}` renderer; validation at save time; render at ingestion (422 on missing field)
+- [Done] Admin template API (upsert with versioning, list, get)
+- [Done] Dockerfile (one image, non-root) + Compose `migrate` / `api` / `worker` services
+- [Done] Auth tests (401 cases) and SQLSTATE-precise constraint tests
+- [Done] Verified end to end inside Docker on 2026-10-20 (rendered email in Mailpit, feed title/body, graceful worker stop)
+- [Deliberately not done] `/auth/register` + `/auth/login`: callers are tenant backends, so the credential is an API key, not a user password session
+- [Deliberately not done] `POST /notifications`: `POST /v1/events` already creates notifications; a second write path would duplicate idempotency and fan-out
+
 ## Current focus
-V1 complete. Candidate next steps, in priority order:
+Next from the plan: step 2, Redis (per-tenant rate limiting first, then template caching with hit-rate measurement).
+Other candidate next steps, in priority order:
 1. Per-tenant fairness / rate limiting (one tenant can currently fill the queue)
 2. Retention: time-partition `events`/`deliveries`/`delivery_attempts`
 3. Pin resolved IP for webhook connections (DNS-rebinding gap)

@@ -51,6 +51,7 @@ erDiagram
 | `notifications` | One logical event notification per recipient. |
 | `deliveries` | One channel-specific job and current state. |
 | `delivery_attempts` | Append-only provider-attempt audit. |
+| `notification_templates` | Tenant-authored email/in-app templates, one per `(event_type, channel)`. |
 
 Every tenant-owned row has `tenant_id`, even where it can be derived from a
 parent. This makes scoping and future row-level security clear. Child-table
@@ -202,6 +203,36 @@ Implementation notes on the DDL above:
 - `'webhook'` was added to `delivery_channel` by a later migration. PostgreSQL
   cannot use a new enum value in the transaction that added it, so that statement
   runs in an autocommit block; enum values cannot be dropped on downgrade.
+
+Templates (added after V1):
+
+```sql
+CREATE TABLE notification_templates (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL REFERENCES tenants(id),
+  event_type TEXT NOT NULL,
+  channel delivery_channel NOT NULL CHECK (channel IN ('email', 'in_app')),
+  subject TEXT,                       -- email subject / in-app title
+  body TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+  active BOOLEAN NOT NULL DEFAULT true,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, event_type, channel),   -- also serves the ingestion lookup
+  UNIQUE (tenant_id, id),
+  CHECK (channel <> 'email' OR subject IS NOT NULL)
+);
+
+ALTER TABLE deliveries ADD COLUMN content JSONB
+  CHECK (content IS NULL OR jsonb_typeof(content) = 'object');
+```
+
+`deliveries.content` holds `{subject, body, template_id, template_version}`,
+rendered at ingestion for the same reason `target_snapshot` is: a retry sends what
+was decided at planning time, and the audit trail shows exactly which template
+version produced it. In SQLAlchemy the column is `JSONB(none_as_null=True)`.
+Without that flag, Python `None` is stored as the JSON value `'null'` rather than
+SQL `NULL`, and the CHECK above rejects it. The constraint is what caught this bug.
 
 `target_snapshot` records the minimum safe target at planning time. Changing a
 user email or endpoint later does not change audit history or redirect retries.

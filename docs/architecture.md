@@ -103,7 +103,7 @@ stateDiagram-v2
 1. The producer sends an authenticated request with `Idempotency-Key`.
 2. The API validates it, derives `tenant_id`, and hashes normalized content.
 3. One PostgreSQL transaction creates the event, notifications, and pending
-   deliveries. `(tenant_id, idempotency_key)` prevents duplicate ingestion.
+   deliveries, rendering any active email/in-app templates into each delivery. `(tenant_id, idempotency_key)` prevents duplicate ingestion.
 4. Only after commit does the API return `202 Accepted`. A matching retry returns
    the original event; a changed request using the key returns `409`.
 5. A worker atomically claims due rows with `FOR UPDATE SKIP LOCKED`, marks them
@@ -178,7 +178,7 @@ write event plus outbox row in one transaction, then publish the outbox.
 
 ## Validation plan
 
-All items below are implemented (61 tests; CI runs them against PostgreSQL 16).
+All items below are implemented (90 tests; CI runs them against PostgreSQL 16).
 
 - [x] Unit-test validation, fan-out, idempotency comparison, transition rules, and
   retry classification. (`tests/test_providers.py`, no database needed)

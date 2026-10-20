@@ -13,6 +13,7 @@ from the original design and why.
 | `GET /v1/users/{user_id}/in-app-notifications` | any | Implemented |
 | `POST /v1/in-app-notifications/{delivery_id}/read` | any | Implemented |
 | `POST /v1/users` | admin | Implemented |
+| `POST /v1/templates`, `GET /v1/templates`, `GET /v1/templates/{id}` | admin | Implemented |
 | `POST/GET /v1/webhook-endpoints`, `PATCH /v1/webhook-endpoints/{id}` | admin | Implemented |
 | `GET /healthz` | none | Implemented (liveness only; not in OpenAPI schema) |
 
@@ -210,6 +211,8 @@ whether its caller may read this `user_id`.
       "notification_id": "d1e58638-6f17-4d24-baaa-31f6948a4c21",
       "event_type": "order.paid",
       "subject": {"type": "order", "id": "ord_123"},
+      "title": "Payment received",
+      "body": "4999 INR",
       "payload": {"order_id": "ord_123", "amount": 4999, "currency": "INR"},
       "read_at": null,
       "created_at": "2026-09-14T12:30:00Z"
@@ -223,6 +226,43 @@ whether its caller may read this `user_id`.
 feed item with its `read_at` timestamp; repeating it keeps the first `read_at`
 (`COALESCE(read_at, now())`). A non-in-app, not-yet-delivered, or cross-tenant ID
 is `404`.
+
+## Notification templates
+
+`POST /v1/templates` (admin) creates or updates the template for one
+`(event_type, channel)` pair. `201` on create, `200` on update; `version` goes up
+only when the content actually changes.
+
+```json
+{
+  "event_type": "order.paid",
+  "channel": "email",
+  "subject": "Order {{ subject.id }} is paid",
+  "body": "Hi {{ recipient.external_id }}, we received {{ payload.amount }} {{ payload.currency }}.",
+  "active": true
+}
+```
+
+| Field | Rules |
+| --- | --- |
+| `channel` | `email` or `in_app`. Webhooks always receive the structured JSON body, never a template. |
+| `subject` | Required for email (the email subject); optional for in-app (the item's `title`). Max 200 characters. |
+| `body` | Required, max 16 KiB. |
+| Placeholders | `{{ path }}` where `path` starts with `event_type`, `subject`, `payload`, or `recipient` (`recipient.external_id`, `recipient.email`). Dotted keys and list indexes (`payload.items.0.sku`) only: no filters, expressions, or loops. Invalid syntax or an unknown root is `400` at save time. |
+
+Rendering happens **at ingestion**:
+
+- If the active template for an event's type and channel references a field the
+  payload lacks, `POST /v1/events` returns `422` naming the template and the
+  missing variable, and nothing is written.
+- Rendered text is stored on the delivery. Editing a template later changes
+  future events only; queued and retried deliveries keep their original content.
+- Rendered output is capped at 64 KiB.
+- With no active template, email falls back to a generic body containing the
+  payload JSON, and in-app items have `title` and `body` set to `null`.
+
+`GET /v1/templates?event_type=…&limit=&cursor=` lists templates; `GET
+/v1/templates/{id}` returns one. Both require an admin key.
 
 ## Tenant administration
 
