@@ -34,6 +34,14 @@ def delivery_topic() -> str:
     return os.getenv("KAFKA_DELIVERY_TOPIC", DEFAULT_DELIVERY_TOPIC)
 
 
+def dead_letter_topic() -> str:
+    """Messages the consumer can never process (malformed), with provenance headers."""
+    return f"{delivery_topic()}.dlq"
+
+
+DEAD_LETTER_RETENTION_MS = 30 * 24 * 3600 * 1000  # long enough for a human to look
+
+
 def consumer_group() -> str:
     return os.getenv("KAFKA_CONSUMER_GROUP", DEFAULT_CONSUMER_GROUP)
 

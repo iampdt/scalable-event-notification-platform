@@ -138,8 +138,20 @@ and a measured comparison against Postgres polling.
 - [Done] Kafka outage verified live: ingestion unaffected, outbox drained after recovery
 - [Corrected] The throughput justification for Kafka was wrong; the ceiling is Postgres state writes
 
+### Plan alignment, step 4 (reliability engineering)
+Done when: for every important failure mode you can answer what fails, what the
+user sees, what gets retried, where the message goes, and how it recovers.
+- [Done] Broke PostgreSQL first: found plain-text 500s, no readiness signal, and a crash-looping relay
+- [Done] `503` + `Retry-After`, envelope-preserving `500`, `/readyz`, 3 s connect timeout, in-process backoff
+- [Done] Dead-letter queue API: list, detail with attempt and redrive history, single and bulk redrive (audited, SKIP LOCKED)
+- [Done] Kafka DLQ topic with provenance headers; `kafka_dlq --list/--replay`; poison messages never committed without a DLQ
+- [Done] Circuit breakers per endpoint/provider in Redis (half-open probe, doubling cooldown, deferral without spending attempts)
+- [Done] Black-hole experiment: healthy tenant's wait 41 s → 11 s, black-hole requests 46 → 10
+- [Done] Live experiments: Postgres down, worker SIGKILL, malformed message (plus Redis and Kafka from earlier steps)
+- [Done] docs/failure-experiments.md
+
 ## Current focus
-Next from the plan: step 4, reliability engineering (dead-letter flow with replay, provider circuit breaker, failure experiment report).
+Next from the plan: step 5, observability and scale (structured logs, Prometheus metrics including per-cache hit rate and consumer lag, Grafana dashboard).
 Other candidate next steps, in priority order:
 1. Per-cache hit/miss metrics (Redis's server-wide hit rate mixes cache and limiter keys)
 2. Retention: time-partition `events`/`deliveries`/`delivery_attempts`

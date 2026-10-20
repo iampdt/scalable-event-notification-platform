@@ -20,7 +20,8 @@ def database_url() -> str:
 # and every worker process the same. Their sum across all processes must stay
 # under PostgreSQL's max_connections (100 by default). pool_timeout fails fast
 # (5 s) instead of letting requests hang 30 s when the pool is exhausted.
-engine = create_engine(database_url(), pool_pre_ping=True, **db_pool_settings())
+# connect_timeout: a partitioned network fails a connection in 3 s instead of hanging.
+engine = create_engine(database_url(), pool_pre_ping=True, connect_args={"connect_timeout": 3}, **db_pool_settings())
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 def get_session() -> Generator[Session, None, None]:

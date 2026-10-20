@@ -376,6 +376,31 @@ RETURNING id;
 | `pending` | `suppressed` | Target unavailable or preference blocks send. |
 | `processing` | `processing` | Expired lease is reclaimed and attempt count increases (only while `attempt_count < max_attempts`). |
 | `processing` | `failed` | Lease expired with no attempts left (`last_error_code = 'worker_lost'`, poison-message guard). |
+| `processing` | `pending` | Circuit open for the target: deferred, `attempt_count - 1` (the claim is handed back, no attempt row). |
+| `failed` | `pending` | Admin redrive: `max_attempts = attempt_count + extra`, audit row in `delivery_redrives`. |
+
+Dead-letter support:
+
+```sql
+CREATE INDEX idx_deliveries_dead_letters ON deliveries (tenant_id, failed_at DESC, id DESC)
+  WHERE status = 'failed';
+
+CREATE TABLE delivery_redrives (          -- one row per manual replay
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL,
+  delivery_id UUID NOT NULL,
+  api_key_id UUID NOT NULL REFERENCES api_keys(id),
+  reason TEXT,
+  previous_attempt_count INTEGER NOT NULL,
+  previous_error_code TEXT,
+  extra_attempts INTEGER NOT NULL CHECK (extra_attempts > 0),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  FOREIGN KEY (tenant_id, delivery_id) REFERENCES deliveries(tenant_id, id)
+);
+```
+
+Redrive locks the target rows with `FOR UPDATE SKIP LOCKED` and requires
+`status = 'failed'`, so concurrent redrives can never enqueue a delivery twice.
 
 Note that `suppressed` is decided at **planning time** (the delivery is inserted
 as suppressed), not by a worker transition. `delivery_attempts.outcome` records

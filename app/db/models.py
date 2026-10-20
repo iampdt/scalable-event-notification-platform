@@ -180,6 +180,25 @@ class DeliveryAttempt(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class DeliveryRedrive(Base):
+    """Audit row for each manual replay of a dead-lettered delivery."""
+
+    __tablename__ = "delivery_redrives"
+    __table_args__ = (ForeignKeyConstraint(["tenant_id", "delivery_id"], ["deliveries.tenant_id", "deliveries.id"]), CheckConstraint("extra_attempts > 0"))
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    delivery_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    api_key_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("api_keys.id"), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    previous_attempt_count: Mapped[int] = mapped_column(Integer)
+    previous_error_code: Mapped[str | None] = mapped_column(Text)
+    extra_attempts: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+Index("idx_delivery_redrives_delivery", DeliveryRedrive.tenant_id, DeliveryRedrive.delivery_id, DeliveryRedrive.created_at)
+
+
 class OutboxMessage(Base):
     """Transactional outbox: written with the state change, published by the relay, then deleted."""
 
@@ -205,5 +224,6 @@ Index("idx_notifications_tenant_created", Notification.tenant_id, Notification.c
 Index("idx_notifications_user_created", Notification.tenant_id, Notification.user_id, Notification.created_at.desc())
 Index("idx_deliveries_due", Delivery.next_attempt_at, Delivery.id, postgresql_where=Delivery.status == DeliveryStatus.pending)
 Index("idx_deliveries_expired_lease", Delivery.lease_expires_at, Delivery.id, postgresql_where=Delivery.status == DeliveryStatus.processing)
+Index("idx_deliveries_dead_letters", Delivery.tenant_id, Delivery.failed_at.desc(), Delivery.id.desc(), postgresql_where=Delivery.status == DeliveryStatus.failed)
 Index("idx_deliveries_notification", Delivery.tenant_id, Delivery.notification_id)
 Index("idx_attempts_delivery", DeliveryAttempt.tenant_id, DeliveryAttempt.delivery_id, DeliveryAttempt.attempt_number)

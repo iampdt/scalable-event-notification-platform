@@ -19,9 +19,11 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from confluent_kafka import Consumer, KafkaError, KafkaException, TopicPartition
+from datetime import datetime, timezone
 
-from app.messaging import consumer_config, delivery_topic, parse_delivery_message
+from confluent_kafka import Consumer, KafkaError, KafkaException, Producer, TopicPartition
+
+from app.messaging import consumer_config, dead_letter_topic, delivery_topic, parse_delivery_message, producer_config
 from app.workers.delivery_worker import DeliveryWorker, GracefulExit
 
 logger = logging.getLogger(__name__)
@@ -36,7 +38,23 @@ def rewind(consumer: Consumer, messages: list) -> None:
         consumer.seek(TopicPartition(topic, partition, offset))
 
 
-def consume_once(consumer: Consumer, worker: DeliveryWorker, batch_size: int, executor: ThreadPoolExecutor | None = None, timeout: float = 1.0) -> int:
+def dead_letter(producer: Producer, message, error: str) -> None:
+    """Copy an unprocessable message to the DLQ topic, with where it came from and why."""
+    producer.produce(
+        dead_letter_topic(),
+        key=message.key(),
+        value=message.value(),
+        headers={
+            "dlq.error": error,
+            "dlq.source.topic": message.topic(),
+            "dlq.source.partition": str(message.partition()),
+            "dlq.source.offset": str(message.offset()),
+            "dlq.failed_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def consume_once(consumer: Consumer, worker: DeliveryWorker, batch_size: int, executor: ThreadPoolExecutor | None = None, timeout: float = 1.0, dlq: Producer | None = None) -> int:
     """One batch. Returns messages handled; raises nothing for per-message problems."""
     # Two-phase fetch: block for the first message, then take whatever else is
     # already buffered without waiting. consume(n, timeout) alone waits up to
@@ -46,7 +64,7 @@ def consume_once(consumer: Consumer, worker: DeliveryWorker, batch_size: int, ex
         return 0
     if batch_size > 1:
         messages += consumer.consume(num_messages=batch_size - 1, timeout=0)
-    data, ids = [], []
+    data, ids, poison = [], [], []
     for message in messages:
         if message.error():
             if message.error().code() != KafkaError._PARTITION_EOF:
@@ -55,14 +73,25 @@ def consume_once(consumer: Consumer, worker: DeliveryWorker, batch_size: int, ex
         data.append(message)
         try:
             ids.append(parse_delivery_message(message.value()))
-        except (ValueError, KeyError, TypeError):
-            # A malformed message can never succeed; skipping it (it is committed
-            # with the batch) keeps one bad record from blocking the partition.
-            logger.error("poison_message_skipped topic=%s partition=%s offset=%s", message.topic(), message.partition(), message.offset())
+        except (ValueError, KeyError, TypeError) as exc:
+            # A malformed message can never succeed. Retrying it would block the
+            # partition forever, so it goes to the dead-letter topic instead.
+            logger.error("poison_message topic=%s partition=%s offset=%s", message.topic(), message.partition(), message.offset())
+            poison.append((message, f"{type(exc).__name__}: {exc}"[:300]))
     if not data:
         return 0
     try:
         worker.process_ids(ids, executor)
+        if poison:
+            if dlq is None:
+                # Never commit past a poison message without parking it somewhere.
+                raise RuntimeError("poison message but no dead-letter producer configured")
+            for message, error in poison:
+                dead_letter(dlq, message, error)
+            if dlq.flush(10):
+                # The DLQ copy isn't acknowledged: don't commit, or the poison
+                # message would be lost rather than parked.
+                raise RuntimeError("dead-letter publish not acknowledged")
     except Exception:
         logger.exception("batch_failed size=%s; rewinding for redelivery", len(data))
         rewind(consumer, data)
@@ -88,6 +117,7 @@ def main() -> None:
     worker = DeliveryWorker(lease_seconds=args.lease_seconds, concurrency=args.concurrency)
     worker.check_lease_budget(args.batch_size)
     consumer = Consumer(consumer_config())
+    dlq = Producer(producer_config())
     consumer.subscribe(
         [delivery_topic()],
         on_assign=lambda c, partitions: logger.info("partitions_assigned %s", [p.partition for p in partitions]),
@@ -100,7 +130,7 @@ def main() -> None:
     try:
         with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
             while not stop.requested:
-                count = consume_once(consumer, worker, args.batch_size, executor)
+                count = consume_once(consumer, worker, args.batch_size, executor, dlq=dlq)
                 if count:
                     batches, handled = batches + 1, handled + count
                 if time.monotonic() >= report_at:

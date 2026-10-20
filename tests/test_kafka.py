@@ -48,8 +48,11 @@ def topic():
     if kafka_reachable():
         # delete_topics is async: keep the client alive and wait for the result.
         admin = AdminClient({"bootstrap.servers": BOOTSTRAP})
-        for future in admin.delete_topics([name]).values():
-            future.result(timeout=15)
+        for future in admin.delete_topics([name, f"{name}.dlq"]).values():
+            try:
+                future.result(timeout=15)
+            except Exception:  # noqa: BLE001 - the .dlq topic exists only if a test created it
+                pass
     # Outbox rows addressed to the deleted topic would otherwise linger in the test DB.
     from sqlalchemy import delete
     from app.db.models import OutboxMessage
@@ -108,11 +111,14 @@ def drain_outbox(relay) -> None:
 
 
 def consume_until(predicate, consumer, worker, deadline_seconds: float = 30.0) -> None:
+    from confluent_kafka import Producer
+    from app.messaging import producer_config
     from app.workers.kafka_consumer import consume_once
 
+    dlq = Producer(producer_config())
     deadline = time.monotonic() + deadline_seconds
     while time.monotonic() < deadline:
-        consume_once(consumer, worker, batch_size=100, timeout=0.5)
+        consume_once(consumer, worker, batch_size=100, timeout=0.5, dlq=dlq)
         if predicate():
             return
     raise AssertionError("condition not met before deadline")
@@ -345,3 +351,89 @@ def test_backfill_enqueues_pending_deliveries_that_have_no_outbox_row(kafka_mode
     assert len(outbox_rows([delivery_id])) == 1
     relay.backfill()  # idempotent: no second row
     assert len(outbox_rows([delivery_id])) == 1
+
+
+@needs_kafka
+def test_malformed_message_goes_to_the_dead_letter_topic_with_provenance(tenant, kafka_mode):
+    from confluent_kafka import Consumer, Producer
+    from app.messaging import consumer_config, dead_letter_topic, delivery_topic, producer_config
+    from app.scripts.kafka_topics import ensure_topics
+    from app.testing import create_delivery, get_delivery
+    from app.workers.delivery_worker import DeliveryWorker
+
+    ensure_topics()  # creates the module topic's .dlq sibling too
+    good = create_delivery(channel="in_app")
+    producer = Producer(producer_config())
+    producer.produce(delivery_topic(), key="bad", value=b"not json at all")
+    producer.produce(delivery_topic(), key=str(good), value=f'{{"delivery_id": "{good}", "tenant_id": "x"}}')
+    producer.flush(10)
+
+    reader = Consumer({**consumer_config(), "group.id": f"dlq-read-{uuid.uuid4().hex[:6]}"})
+    reader.subscribe([dead_letter_topic()])
+    found: list = []
+
+    def both_handled() -> bool:
+        # The two messages sit on different partitions; wait for *both* outcomes.
+        found.extend(m for m in reader.consume(num_messages=10, timeout=0.2) if not m.error())
+        return bool(found) and get_delivery(good).status.value == "delivered"
+
+    consumer = new_consumer()
+    try:
+        consume_until(both_handled, consumer, DeliveryWorker())
+    finally:
+        consumer.close()
+        reader.close()
+    assert found and found[0].value() == b"not json at all"
+    headers = {k: v.decode() for k, v in found[0].headers()}
+    assert headers["dlq.source.topic"] == delivery_topic() and "dlq.error" in headers
+
+
+def test_poison_message_is_never_committed_without_a_dead_letter_producer():
+    """Regression: dlq=None used to log the message and commit past it (silent loss)."""
+    from app.workers.kafka_consumer import consume_once
+
+    class Message:
+        def __init__(self):
+            self._offset = 7
+
+        def error(self):
+            return None
+
+        def value(self):
+            return b"garbage"
+
+        def topic(self):
+            return "t"
+
+        def partition(self):
+            return 0
+
+        def offset(self):
+            return self._offset
+
+    class FakeConsumer:
+        def __init__(self):
+            self.committed, self.sought = False, []
+
+        def consume(self, num_messages, timeout):
+            return [Message()] if num_messages == 1 else []
+
+        def commit(self, asynchronous=False):
+            self.committed = True
+
+        def seek(self, tp):
+            self.sought.append((tp.partition, tp.offset))
+
+    class NoopWorker:
+        def process_ids(self, ids, executor=None):
+            return 0
+
+    consumer = FakeConsumer()
+    import app.workers.kafka_consumer as module
+    original_sleep = module.time.sleep
+    module.time.sleep = lambda s: None
+    try:
+        assert consume_once(consumer, NoopWorker(), batch_size=10) == 0
+    finally:
+        module.time.sleep = original_sleep
+    assert consumer.committed is False and consumer.sought == [(0, 7)]
