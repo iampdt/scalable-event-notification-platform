@@ -147,6 +147,22 @@ as a provider idempotency key when supported and as
 - Provider diagnostics are truncated and scrubbed before persistence: only status
   codes and short messages, never receiver response bodies or exception traces.
 - Lease and schedule times use the database clock, never worker clocks.
+- **Circuit breakers** per webhook endpoint and per email provider, shared by all
+  workers through Redis. Five consecutive health failures (timeouts, connection
+  errors, 5xx, 429) open the circuit. While it's open, deliveries are *deferred*
+  without spending an attempt. After a 30 s cooldown one half-open probe is
+  allowed; a failed probe doubles the cooldown (up to 5 min). This isolates
+  tenants: one dead endpoint can't occupy the workers. Measured with a
+  black-hole endpoint, a healthy tenant's wait fell from 41 s to 11 s. No Redis
+  means no breaker.
+- **Dead-letter queue:** failed deliveries keep their attempt history and can be
+  inspected and replayed through the admin API (audited, attempt budget
+  renewed). Malformed Kafka messages go to a `<topic>.dlq` topic with provenance
+  headers.
+- **Database outages:** the API answers `503` + `Retry-After`; `/readyz` fails
+  while `/healthz` (liveness) stays green; workers back off in-process rather than
+  crash-looping.
+- Every failure mode, with live experiments: [failure-experiments.md](failure-experiments.md).
 
 ## Tenant boundary and modules
 

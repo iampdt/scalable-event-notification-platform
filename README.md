@@ -38,6 +38,11 @@ flowchart LR
   against stale workers.
 - **Retry policy:** retryable vs permanent classification, exponential backoff
   with jitter, `Retry-After`, 5 attempts.
+- **Dead-letter queue with audited replay** (admin API), plus a Kafka DLQ topic
+  for malformed messages.
+- **Circuit breakers** per webhook endpoint: a dead endpoint defers its
+  deliveries instead of tying up workers. In the black-hole experiment, a
+  healthy tenant's wait fell from 41 s to 11 s.
 - **Per-tenant rate limiting:** GCRA (a token-bucket equivalent) in an atomic
   Redis Lua script, returning `429` + `Retry-After`; it held to within 1% of the
   configured limit under load.
@@ -63,6 +68,7 @@ flowchart LR
 | Doc | What's in it |
 | --- | --- |
 | [docs/benchmarks.md](docs/benchmarks.md) | Load-test method, results, and the bottleneck investigation |
+| [docs/failure-experiments.md](docs/failure-experiments.md) | What happens when each dependency or component fails, tested live |
 | [docs/architecture.md](docs/architecture.md) | Requirements, lifecycle, reliability model, roadmap |
 | [docs/database.md](docs/database.md) | Schema, indexes, transactions, claim/completion SQL |
 | [docs/api.md](docs/api.md) | HTTP contract and error model |
@@ -144,7 +150,7 @@ TEST_DATABASE_URL=postgresql+psycopg://notification_app:local_dev_password@local
   .venv/bin/pytest -q
 ```
 
-There are 112 tests. Provider and retry unit tests run without a database; the
+There are 128 tests. Provider and retry unit tests run without a database; the
 integration tests (idempotency races, tenant isolation, leases, fencing, retries,
 webhooks, feed) are skipped unless `TEST_DATABASE_URL` is set. CI also checks the
 migration chain from scratch and that the models match it (`alembic check`).

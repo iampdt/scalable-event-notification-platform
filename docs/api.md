@@ -16,6 +16,8 @@ from the original design and why.
 | `POST /v1/templates`, `GET /v1/templates`, `GET /v1/templates/{id}` | admin | Implemented |
 | `POST/GET /v1/webhook-endpoints`, `PATCH /v1/webhook-endpoints/{id}` | admin | Implemented |
 | `GET /healthz` | none | Implemented (liveness only; not in OpenAPI schema) |
+| `GET /readyz` | none | Implemented (readiness: `503` when PostgreSQL is unreachable; reports Redis) |
+| `GET /v1/dead-letters`, `GET /v1/dead-letters/{id}`, `POST /v1/dead-letters/{id}/redrive`, `POST /v1/dead-letters/redrive` | admin | Implemented |
 
 Interactive docs are served by FastAPI at `/docs` while the API is running.
 
@@ -61,7 +63,8 @@ Interactive docs are served by FastAPI at `/docs` while the API is running.
 | 413 | `payload_too_large` | Body or payload exceeded a limit. |
 | 422 | `unprocessable` | JSON is valid but violates a domain rule. |
 | 429 | `rate_limited` | Tenant exceeded its ingestion rate limit (`POST /v1/events` only). Includes `Retry-After` (seconds). |
-| 500 | `internal_error` | Unexpected error; retry only with the same idempotency key. |
+| 500 | `internal_error` | Unexpected error; retry only with the same idempotency key. Details are logged, never returned. |
+| 503 | `service_unavailable` | PostgreSQL is unreachable. Includes `Retry-After` (seconds); retry with the same idempotency key. |
 
 Tenant isolation intentionally returns `404` rather than exposing whether another
 tenant owns a supplied identifier.
@@ -283,6 +286,47 @@ Rendering happens **at ingestion**:
 
 `GET /v1/templates?event_type=…&limit=&cursor=` lists templates; `GET
 /v1/templates/{id}` returns one. Both require an admin key.
+
+## Dead-letter queue
+
+A delivery is dead-lettered when it fails permanently (for example a webhook
+`410`) or exhausts its attempts. It stays `failed` with its full attempt history;
+nothing is deleted. All endpoints below require an admin key and are
+tenant-scoped (another tenant's id is `404`).
+
+`GET /v1/dead-letters?channel=&error_code=&limit=&cursor=`, newest failure first:
+
+```json
+{
+  "data": [{
+    "delivery_id": "…", "notification_id": "…", "event_id": "…", "event_type": "order.paid",
+    "user_id": "…", "channel": "webhook", "attempt_count": 5, "max_attempts": 5,
+    "last_error_code": "503", "failed_at": "2026-10-21T10:00:00Z", "redrive_count": 0,
+    "last_attempt": {"attempt_number": 5, "outcome": "retryable_failure", "provider_status_code": 503,
+                     "provider_message": "webhook responded HTTP 503", "started_at": "…", "completed_at": "…"}
+  }],
+  "next_cursor": null
+}
+```
+
+`GET /v1/dead-letters/{delivery_id}` adds `attempts` (every attempt) and
+`redrives` (every replay: reason, previous attempt count and error, extra attempts).
+
+`POST /v1/dead-letters/{delivery_id}/redrive` with an optional
+`{"reason": "receiver fixed", "extra_attempts": 3}` (1–10, default 3) returns `202`.
+The delivery becomes `pending` and due now, with `max_attempts = attempt_count +
+extra_attempts`. Attempt numbering continues and history is kept. A delivery that
+isn't currently failed (for example, already redriven) is `404`, so two operators
+can't double-enqueue it.
+
+`POST /v1/dead-letters/redrive` with
+`{"channel": "webhook", "error_code": "503", "limit": 100, "reason": "…"}` does a
+bulk replay (at most 1,000 per call) and returns
+`{"redriven_count": n, "redriven": [ids]}`.
+
+`last_error_code` values worth knowing: an HTTP or SMTP status code,
+`retryable_failure` / `permanent_failure`, and `worker_lost` (the delivery kept
+crashing workers; investigate before replaying).
 
 ## Tenant administration
 
