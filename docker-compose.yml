@@ -1,3 +1,20 @@
+# Full local stack:   docker compose up -d --build
+# Infrastructure only (run API/worker from your venv):   docker compose up -d postgres mailpit
+
+# API, worker, and migrations are one image run with different commands.
+x-app: &app
+  build: .
+  image: notification-platform:local
+  environment: &app-env
+    DATABASE_URL: postgresql+psycopg://notification_app:local_dev_password@postgres:5432/notifications
+    # Local-development values only; see .env.example.
+    WEBHOOK_SECRET_ENCRYPTION_KEY: UtdpRhP4WrBOSC0yYXp2TYAniAUkhyKZF8AhZphjqIQ=
+    WEBHOOK_ALLOW_PRIVATE_NETWORKS: "true"
+    EMAIL_PROVIDER: smtp
+    SMTP_HOST: mailpit
+    SMTP_PORT: "1025"
+    EMAIL_FROM: notifications@example.test
+
 services:
   postgres:
     image: postgres:16
@@ -29,6 +46,39 @@ services:
     ports:
       - "1025:1025"
       - "8025:8025"
+
+  # One-shot: apply migrations, then exit. API and worker wait for it to succeed,
+  # so the app never starts against an old schema and never runs create_all().
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.workers.delivery_worker"]
+    restart: unless-stopped
+    # SIGTERM lets the worker finish its in-flight batch; give it time to.
+    stop_grace_period: 30s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   postgres_data:
