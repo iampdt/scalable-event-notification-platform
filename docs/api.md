@@ -32,6 +32,8 @@ Interactive docs are served by FastAPI at `/docs` while the API is running.
   cursor is `400 validation_error`.
 - Every response carries `X-Request-Id` (echoed from the request or generated);
   error bodies include the same value as `request_id`.
+- Credential records are cached for up to 60 s, so a key revoked or a tenant
+  disabled directly in the database stops working within that window.
 - Roles: `producer` keys may ingest and read; `admin` keys may additionally call
   the tenant administration endpoints. Producer keys get `403 forbidden` there.
 
@@ -58,7 +60,7 @@ Interactive docs are served by FastAPI at `/docs` while the API is running.
 | 409 | `conflict` | A concurrent admin write won (e.g. two endpoints made default at once); retry. |
 | 413 | `payload_too_large` | Body or payload exceeded a limit. |
 | 422 | `unprocessable` | JSON is valid but violates a domain rule. |
-| 429 | `rate_limited` | Future quota control; not implemented in V0.1. |
+| 429 | `rate_limited` | Tenant exceeded its ingestion rate limit (`POST /v1/events` only). Includes `Retry-After` (seconds). |
 | 500 | `internal_error` | Unexpected error; retry only with the same idempotency key. |
 
 Tenant isolation intentionally returns `404` rather than exposing whether another
@@ -125,6 +127,24 @@ A repeat with the same key and body returns `202` with the original `id` and
 counts. Two simultaneous requests with the same key are resolved by the database
 unique constraint: one creates, the other replays (or gets `409` if its body differs).
 An unknown or inactive recipient returns `422` and nothing is written.
+
+### Rate limiting
+
+`POST /v1/events` is limited per tenant (not per key) with GCRA, a token-bucket
+equivalent: up to `burst` events at once, refilling at `rate` per second.
+Defaults are 50/s with burst 100 (`RATE_LIMIT_PER_SECOND`, `RATE_LIMIT_BURST`).
+A tenant can be given its own limit in `tenants.rate_limit_per_second` /
+`rate_limit_burst`. Over the limit:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 1
+
+{"error": {"code": "rate_limited", "message": "Tenant ingestion rate limit exceeded; retry after 1s.", "request_id": "..."}}
+```
+
+Retry with the **same** `Idempotency-Key`. Reads are not rate limited. If Redis
+is unavailable the limit is not enforced (fail open); ingestion keeps working.
 
 ## Read event status
 

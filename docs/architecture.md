@@ -10,9 +10,14 @@ event; the platform persists it, creates notifications for requested recipients,
 and delivers them through email, webhook, or an in-app feed.
 
 V0 is deliberately a modular FastAPI application with PostgreSQL. PostgreSQL is
-the durable state store and initial job queue. Redis, Kafka, microservices,
-Kubernetes, and cloud infrastructure are deferred until measured needs justify
-them.
+the durable state store and initial job queue. Kafka, microservices, Kubernetes,
+and cloud infrastructure are deferred until measured needs justify them.
+
+Redis was added after V1 for two jobs PostgreSQL does poorly per request:
+per-tenant rate limiting and caching hot read-only lookups (credentials,
+templates). It is never a source of truth, and **every Redis failure degrades
+to "no cache, no limit"** rather than to errors (see
+[Redis failure behaviour](#redis-failure-behaviour)).
 
 ## Learn before implementation
 
@@ -164,11 +169,33 @@ impossible at the schema level, and cross-tenant lookups return `404` rather tha
 | `persistence` | Engine/session, models (migrations own the DDL) | `app/db/`, `alembic/versions/` |
 | `scripts` | Seed, queue stats, reference webhook receiver | `app/scripts/` |
 
+## Redis failure behaviour
+
+| Redis use | Data | If Redis is down or slow |
+| --- | --- | --- |
+| Credential cache (`auth:{prefix}`, 60 s TTL) | Key hash, role, tenant status, rate limits | Read from PostgreSQL (one join) |
+| Template cache (`templates:{tenant}:{event_type}`, 60 s TTL) | Active templates, including "none" | Read from PostgreSQL |
+| Rate limiter (`ratelimit:ingest:{tenant}`) | One GCRA timestamp per tenant | **Fail open**: requests are allowed |
+| `last_used_at` throttle (`lastused:{key}`) | Marker key | Falls back to comparing the stored timestamp |
+
+Mechanics: 50 ms socket timeouts bound added latency, and a circuit breaker skips
+Redis for 5 s after a failure, so an outage costs one timeout per process, not
+one per request. Verified live: with Redis stopped mid-traffic, 60 of 60 events
+were accepted with no latency increase, and one `redis_unavailable` log line.
+
+Staleness: a key revoked, a tenant disabled, or a rate limit changed *directly in
+the database* takes effect within the 60 s cache TTL. Template edits through the
+API invalidate their cache entry immediately (after commit).
+
+Redis runs without persistence (`--save ""`, no AOF) and with
+`allkeys-lru` under a memory cap. Everything in it can be rebuilt from
+PostgreSQL, so durability would only cost write latency.
+
 ## Earned-complexity roadmap
 
 | Component | Add only when evidence shows | Benefit |
 | --- | --- | --- |
-| Redis | Measured caching, rate-limiting, or coordination need. | Speeds a specific transient concern; Postgres remains source of truth. |
+| Redis | Measured caching, rate-limiting, or coordination need. **Added:** rate limiting closes the "one tenant can fill the queue" gap; caching removed 3 of 9 round trips per ingest. | Speeds a specific transient concern; Postgres remains source of truth. |
 | Kafka | Independent consumers need replay/decoupling or the DB queue has measured throughput limits. | Use transactional outbox publishing; consumers remain idempotent. |
 | Separate services | Independent scaling/deployment/isolation has a demonstrated benefit. | Replaces the in-process worker boundary. |
 | Kubernetes | Multiple services/environments need scheduling and autoscaling. | Replaces manual Compose operations. |

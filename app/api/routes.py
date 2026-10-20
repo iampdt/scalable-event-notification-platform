@@ -9,11 +9,11 @@ from fastapi import APIRouter, Depends, Header, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.auth import authenticated_key
+from app.api.auth import Principal, authenticated_key, rate_limited_key
 from app.api.errors import ApiError
 from app.api.pagination import apply_cursor, page
 from app.api.schemas import IngestEvent
-from app.db.models import ApiKey, Delivery, Event, Notification
+from app.db.models import Delivery, Event, Notification
 from app.db.session import get_session
 from app.events.service import ingest
 from app.notifications.status import notification_status, notification_status_sql
@@ -35,14 +35,14 @@ def iso(value):
 def post_event(
     body: IngestEvent,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
-    key: ApiKey = Depends(authenticated_key),
+    key: Principal = Depends(rate_limited_key),
     session: Session = Depends(get_session),
 ) -> dict:
     return ingest(session, key.tenant_id, valid_idempotency_key(idempotency_key), body)
 
 
 @router.get("/events/{event_id}")
-def get_event(event_id: uuid.UUID, key: ApiKey = Depends(authenticated_key), session: Session = Depends(get_session)) -> dict:
+def get_event(event_id: uuid.UUID, key: Principal = Depends(authenticated_key), session: Session = Depends(get_session)) -> dict:
     event = session.scalar(select(Event).where(Event.id == event_id, Event.tenant_id == key.tenant_id))
     if not event:
         raise ApiError(404, "not_found", "Resource was not found.")
@@ -59,7 +59,7 @@ def list_notifications(
     status: Literal["pending", "processing", "delivered", "failed"] | None = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     cursor: str | None = None,
-    key: ApiKey = Depends(authenticated_key),
+    key: Principal = Depends(authenticated_key),
     session: Session = Depends(get_session),
 ) -> dict:
     status_expr = notification_status_sql().label("status")
@@ -80,7 +80,7 @@ def list_notifications(
 
 
 @router.get("/notifications/{notification_id}")
-def get_notification(notification_id: uuid.UUID, key: ApiKey = Depends(authenticated_key), session: Session = Depends(get_session)) -> dict:
+def get_notification(notification_id: uuid.UUID, key: Principal = Depends(authenticated_key), session: Session = Depends(get_session)) -> dict:
     notification = session.scalar(select(Notification).where(Notification.id == notification_id, Notification.tenant_id == key.tenant_id))
     if not notification:
         raise ApiError(404, "not_found", "Resource was not found.")

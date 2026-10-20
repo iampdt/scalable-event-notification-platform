@@ -1,5 +1,5 @@
 # Full local stack:   docker compose up -d --build
-# Infrastructure only (run API/worker from your venv):   docker compose up -d postgres mailpit
+# Infrastructure only (run API/worker from your venv):   docker compose up -d postgres mailpit redis
 
 # API, worker, and migrations are one image run with different commands.
 x-app: &app
@@ -14,6 +14,7 @@ x-app: &app
     SMTP_HOST: mailpit
     SMTP_PORT: "1025"
     EMAIL_FROM: notifications@example.test
+    REDIS_URL: redis://redis:6379/0
 
 services:
   postgres:
@@ -36,6 +37,21 @@ services:
       test: ["CMD-SHELL", "pg_isready -U notification_app -d notifications"]
       interval: 5s
       timeout: 5s
+      retries: 5
+
+  # Cache + rate limiting. Deliberately not persistent: everything in it can be
+  # rebuilt from PostgreSQL, and the app keeps working (degraded) if it is down.
+  redis:
+    image: redis:7.4-alpine
+    container_name: notification-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
       retries: 5
 
   # Local SMTP sink for the real email adapter. SMTP on 1025, web inbox on 8025.

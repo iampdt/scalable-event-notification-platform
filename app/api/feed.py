@@ -9,10 +9,10 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
-from app.api.auth import authenticated_key
+from app.api.auth import Principal, authenticated_key
 from app.api.errors import ApiError
 from app.api.pagination import apply_cursor, page
-from app.db.models import ApiKey, Delivery, DeliveryChannel, DeliveryStatus, Event, Notification, User
+from app.db.models import Delivery, DeliveryChannel, DeliveryStatus, Event, Notification, User
 from app.db.session import get_session
 
 router = APIRouter(prefix="/v1")
@@ -28,7 +28,7 @@ def in_app_feed(
     unread_only: bool = False,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     cursor: str | None = None,
-    key: ApiKey = Depends(authenticated_key),
+    key: Principal = Depends(authenticated_key),
     session: Session = Depends(get_session),
 ) -> dict:
     if not session.scalar(select(User.id).where(User.tenant_id == key.tenant_id, User.id == user_id)):
@@ -49,7 +49,7 @@ def in_app_feed(
 
 
 @router.post("/in-app-notifications/{delivery_id}/read")
-def mark_read(delivery_id: uuid.UUID, key: ApiKey = Depends(authenticated_key), session: Session = Depends(get_session)) -> dict:
+def mark_read(delivery_id: uuid.UUID, key: Principal = Depends(authenticated_key), session: Session = Depends(get_session)) -> dict:
     with session.begin():
         # COALESCE makes the call idempotent: a repeat keeps the first read time.
         updated = session.execute(

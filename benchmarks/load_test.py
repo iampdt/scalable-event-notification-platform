@@ -27,10 +27,11 @@ from app.scripts.stats import collect
 from app.security import generate_api_key
 
 
-def create_tenant(recipients: int) -> tuple[uuid.UUID, str, list[str]]:
+def create_tenant(recipients: int, rate_limit: float | None = None) -> tuple[uuid.UUID, str, list[str]]:
     token, prefix, secret_hash = generate_api_key()
     with SessionLocal.begin() as session:
-        tenant = Tenant(slug=f"load-{uuid.uuid4().hex[:10]}", name="load test")
+        # Effectively unlimited unless --rate-limit is given, so throughput runs measure the platform.
+        tenant = Tenant(slug=f"load-{uuid.uuid4().hex[:10]}", name="load test", rate_limit_per_second=rate_limit or 1_000_000, rate_limit_burst=int(rate_limit or 1_000_000))
         session.add(tenant)
         session.flush()
         users = [User(tenant_id=tenant.id, external_id=f"user-{i}", email=f"user-{i}@example.test") for i in range(recipients)]
@@ -93,13 +94,18 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--worker-batch", type=int, default=10)
     parser.add_argument("--start-workers-first", action="store_true", help="measure steady-state lag instead of backlog drain")
+    parser.add_argument("--rate-limit", type=float, help="give the tenant this events/s limit (burst = same) and report how the limiter behaves")
     args = parser.parse_args()
 
-    tenant_id, token, user_ids = create_tenant(args.recipients)
+    tenant_id, token, user_ids = create_tenant(args.recipients, args.rate_limit)
     channels = args.channels.split(",")
     workers = spawn_workers(args.workers, args.worker_batch) if args.start_workers_first else []
     try:
         latencies, statuses, elapsed = asyncio.run(ingest(args.base_url, token, user_ids, channels, args.events, args.concurrency))
+        if args.rate_limit:
+            accepted = statuses.get(202, 0)
+            print(json.dumps({"rate_limit": args.rate_limit, "seconds": round(elapsed, 2), "statuses": statuses, "accepted_per_second": round(accepted / elapsed, 1), "expected_max": round(args.rate_limit + args.rate_limit / elapsed, 1)}))
+            return
         ingest_done = time.perf_counter()
         if not workers:
             workers = spawn_workers(args.workers, args.worker_batch)

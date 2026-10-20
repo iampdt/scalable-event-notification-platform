@@ -19,11 +19,18 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U notification_app -d notifications_test"
           --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7.4-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
     env:
       DATABASE_URL: postgresql+psycopg://notification_app:ci_password@localhost:5432/notifications_test
       TEST_DATABASE_URL: postgresql+psycopg://notification_app:ci_password@localhost:5432/notifications_test
       WEBHOOK_SECRET_ENCRYPTION_KEY: UtdpRhP4WrBOSC0yYXp2TYAniAUkhyKZF8AhZphjqIQ=
       EMAIL_PROVIDER: fake
+      TEST_REDIS_URL: redis://localhost:6379/15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

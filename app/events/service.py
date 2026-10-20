@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from dataclasses import asdict, dataclass
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -12,6 +13,8 @@ from sqlalchemy.orm import Session
 from app.api.errors import ApiError
 from app.api.schemas import IngestEvent
 from app.db.models import Delivery, DeliveryChannel, DeliveryStatus, Event, Notification, NotificationTemplate, User, WebhookEndpoint
+from app.cache import get_cache
+from app.config import cache_ttl_seconds
 from app.notifications.templates import TemplateError, render
 
 
@@ -48,7 +51,40 @@ def plan_delivery(channel: str, user: User, endpoint: WebhookEndpoint | None) ->
     return {"user_id": str(user.id)}, DeliveryStatus.pending, None
 
 
-def render_content(template: NotificationTemplate, body: IngestEvent, user: User) -> dict:
+@dataclass(frozen=True)
+class TemplateSnapshot:
+    id: str
+    event_type: str
+    channel: str
+    subject: str | None
+    body: str
+    version: int
+
+
+def templates_cache_key(tenant_id: uuid.UUID, event_type: str) -> str:
+    return f"templates:{tenant_id}:{event_type}"
+
+
+def active_templates(session: Session, tenant_id: uuid.UUID, event_type: str) -> dict[str, TemplateSnapshot]:
+    """Cache-aside lookup of every active template for an event type, keyed by channel.
+
+    The empty result is cached too (negative caching): most event types have no
+    template, and without it every one of those events would still query.
+    """
+    cache = get_cache()
+    key = templates_cache_key(tenant_id, event_type)
+    cached = cache.get_json(key)
+    if cached is not None:
+        return {channel: TemplateSnapshot(**value) for channel, value in cached.items()}
+    rows = session.scalars(
+        select(NotificationTemplate).where(NotificationTemplate.tenant_id == tenant_id, NotificationTemplate.event_type == event_type, NotificationTemplate.active.is_(True))
+    )
+    templates = {row.channel.value: TemplateSnapshot(str(row.id), row.event_type, row.channel.value, row.subject, row.body, row.version) for row in rows}
+    cache.set_json(key, {channel: asdict(template) for channel, template in templates.items()}, cache_ttl_seconds())
+    return templates
+
+
+def render_content(template: TemplateSnapshot, body: IngestEvent, user: User) -> dict:
     context = {
         "event_type": body.event_type,
         "subject": {"type": body.subject.type, "id": body.subject.id},
@@ -59,13 +95,13 @@ def render_content(template: NotificationTemplate, body: IngestEvent, user: User
         return {
             "subject": render(template.subject, context) if template.subject else None,
             "body": render(template.body, context),
-            "template_id": str(template.id),
+            "template_id": template.id,
             "template_version": template.version,
         }
     except TemplateError as exc:
         # Rendering at ingestion means the producer hears about a missing field
         # now, as a 422, instead of a delivery failing silently later.
-        raise ApiError(422, "unprocessable", "Event payload does not satisfy the notification template.", [{"field": f"template[{template.event_type}/{template.channel.value}]", "issue": str(exc)}]) from exc
+        raise ApiError(422, "unprocessable", "Event payload does not satisfy the notification template.", [{"field": f"template[{template.event_type}/{template.channel}]", "issue": str(exc)}]) from exc
 
 
 def ingest(session: Session, tenant_id: uuid.UUID, idempotency_key: str, body: IngestEvent) -> dict:
@@ -90,18 +126,7 @@ def ingest(session: Session, tenant_id: uuid.UUID, idempotency_key: str, body: I
             if any("webhook" in recipient.channels for recipient in body.recipients):
                 endpoint = session.scalar(select(WebhookEndpoint).where(WebhookEndpoint.tenant_id == tenant_id, WebhookEndpoint.active.is_(True), WebhookEndpoint.is_default.is_(True)))
 
-            requested_channels = {channel for recipient in body.recipients for channel in recipient.channels}
-            templates = {
-                template.channel.value: template
-                for template in session.scalars(
-                    select(NotificationTemplate).where(
-                        NotificationTemplate.tenant_id == tenant_id,
-                        NotificationTemplate.event_type == body.event_type,
-                        NotificationTemplate.active.is_(True),
-                        NotificationTemplate.channel.in_([DeliveryChannel(c) for c in requested_channels]),
-                    )
-                )
-            }
+            templates = active_templates(session, tenant_id, body.event_type)
 
             created = Event(tenant_id=tenant_id, idempotency_key=idempotency_key, request_hash=request_hash, event_type=body.event_type, subject_type=body.subject.type, subject_id=body.subject.id, payload=body.payload, metadata_=body.metadata)
             session.add(created)

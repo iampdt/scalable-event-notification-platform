@@ -10,7 +10,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, CheckConstraint, LargeBinary, DateTime, Enum, ForeignKey, ForeignKeyConstraint, Index, Integer, Text, UniqueConstraint, func, text
+from sqlalchemy import Boolean, CheckConstraint, LargeBinary, Numeric, DateTime, Enum, ForeignKey, ForeignKeyConstraint, Index, Integer, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -38,10 +38,19 @@ class DeliveryStatus(str, enum.Enum):
 
 class Tenant(Base):
     __tablename__ = "tenants"
+    __table_args__ = (
+        CheckConstraint("slug ~ '^[a-z0-9][a-z0-9-]{1,62}$'", name="tenants_slug_format"),
+        CheckConstraint("status IN ('active', 'disabled')", name="tenants_status_values"),
+        CheckConstraint("rate_limit_per_second IS NULL OR rate_limit_per_second > 0", name="tenants_rate_limit_positive"),
+        CheckConstraint("rate_limit_burst IS NULL OR rate_limit_burst > 0", name="tenants_rate_limit_burst_positive"),
+    )
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
     slug: Mapped[str] = mapped_column(Text, unique=True)
     name: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(Text, server_default=text("'active'"))
+    # NULL = platform default (RATE_LIMIT_PER_SECOND / RATE_LIMIT_BURST).
+    rate_limit_per_second: Mapped[float | None] = mapped_column(Numeric(asdecimal=False))
+    rate_limit_burst: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
