@@ -1,16 +1,19 @@
 # Scalable Event Notification Platform
 
+[![ci](https://github.com/iampdt/scalable-event-notification-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/iampdt/scalable-event-notification-platform/actions/workflows/ci.yml)
+
 A multi-tenant notification service. A tenant's backend posts an event; the
 platform durably records it, fans it out to recipients, and delivers it over
-**email**, **signed webhooks**, and an **in-app feed**, with retries, crash
-recovery, idempotency, and strict tenant isolation.
+**email**, **signed webhooks** and an **in-app feed**, with idempotency, retries,
+crash recovery, dead-letter replay, circuit breakers and strict tenant isolation.
 
-Built as a modular monolith on **FastAPI + PostgreSQL + Redis**. Postgres is both
-the source of truth and the job queue (`FOR UPDATE SKIP LOCKED`). Redis is an
-optional accelerator for caching and per-tenant rate limiting: the platform keeps
-working if it's down. **Kafka** is an alternative dispatch path
-(`DISPATCH_MODE=kafka`): a transactional outbox, a relay, and a consumer group.
-Ingestion keeps working even while Kafka is down.
+It's built learning-first: every component had to earn its place, and every
+performance claim was measured, including the ones that turned out wrong. The
+story is in **[the engineering write-up](docs/engineering-writeup.md)**.
+
+**Stack:** Python 3.12, FastAPI, PostgreSQL 16 (source of truth *and* job
+queue), Redis (optional, fail-open), Kafka (optional dispatch through a
+transactional outbox), Prometheus, Grafana, Docker Compose, GitHub Actions.
 
 ```mermaid
 flowchart LR
@@ -19,134 +22,105 @@ flowchart LR
   API -->|202 after commit| P
   API <-.->|cache + rate limit<br/>fail-open| R[(Redis)]
   DB -->|outbox rows| RL[Outbox relay]
-  RL -->|publish| K[[Kafka topic<br/>notification.deliveries.v1]]
+  RL -->|publish| K[[Kafka topic]]
   K -->|consumer group| W[Workers xN]
-  W -->|fenced claim in Postgres| DB
-  W -->|SMTP| M[Email / Mailpit]
+  W -->|fenced claim + batch completion| DB
+  W -->|SMTP| M[Email]
   W -->|HMAC-signed POST| H[Tenant webhook]
   W -->|mark delivered| F[In-app feed]
-  W -->|fenced batch completion| DB
-  U[Tenant app] -->|status, feed, mark read| API
+  U[Tenant app] -->|status, feed, dead letters| API
 ```
 
-## Highlights
+## Results at a glance
 
-- **Idempotent ingestion.** A tenant-scoped `Idempotency-Key` plus a normalized
-  request hash; concurrent duplicates are resolved by a unique constraint.
-- **At-least-once delivery** with a stable delivery ID for receiver deduplication.
-- **Crash recovery** through leases, with `attempt_count` as a fencing token
-  against stale workers.
-- **Retry policy:** retryable vs permanent classification, exponential backoff
-  with jitter, `Retry-After`, 5 attempts.
-- **Dead-letter queue with audited replay** (admin API), plus a Kafka DLQ topic
-  for malformed messages.
-- **Circuit breakers** per webhook endpoint: a dead endpoint defers its
-  deliveries instead of tying up workers. In the black-hole experiment, a
-  healthy tenant's wait fell from 41 s to 11 s.
-- **Per-tenant rate limiting:** GCRA (a token-bucket equivalent) in an atomic
-  Redis Lua script, returning `429` + `Retry-After`; it held to within 1% of the
-  configured limit under load.
-- **Redis cache-aside:** credentials and templates are cached, cutting database
-  round trips per ingest from 9 to 6 and per authenticated read from 3 to 1.
-  A Redis outage degrades to "no cache, no limit", not to errors.
-- **Kafka with a transactional outbox:** no dual write. Messages are pointers
-  claimed in Postgres, so duplicates are harmless. Measured honestly: Kafka
-  matched Postgres polling on latency and did *not* add throughput, because the
-  ceiling is database state writes. Its value here is push instead of polling,
-  replay, buffering, and room for more consumers.
-- **Observable:** Prometheus metrics (RED, queue saturation, consumer lag,
-  per-cache hit rate), 10 alert rules, a Grafana dashboard generated as code,
-  and JSON logs keyed by `request_id`. Metrics were cross-checked against SQL
-  ground truth.
-- **Templates:** tenant-authored, logic-free `{{ payload.field }}` templates for
-  email and in-app, rendered at ingestion, so a missing field is a `422` for the
-  producer instead of a broken email later.
-- **Webhook security:** HMAC over `timestamp.body`, Fernet-encrypted secrets,
-  SSRF guard, no redirects.
-- **Load-tested:** ingest p95 under 250 ms; about 1,700 deliveries/s with 4 workers on a
-  laptop, after finding and fixing the real bottleneck
-  ([benchmarks](docs/benchmarks.md)).
+All numbers were measured on one 8-core laptop; method and caveats are in [benchmarks.md](docs/benchmarks.md).
+
+| What | Result |
+| --- | --- |
+| Ingest latency (target p95 < 250 ms) | p95 130–240 ms; a 100-recipient event at p95 229 ms |
+| Delivery throughput, 4 workers | 824 → **about 1,650/s** after finding that per-delivery commits contended on WAL writes |
+| Redis cache | DB round trips per ingest **9 → 6**; throughput **+15%** |
+| Kafka vs Postgres polling | Equal latency, **no throughput gain** (the ceiling is Postgres state writes), so the docs were corrected |
+| Circuit breaker vs a dead endpoint | Healthy tenant's wait **41 s → 11 s**; requests into the dead endpoint 46 → 10 |
+| Worker SIGKILLed mid-batch | **6,000/6,000 delivered**, in-flight batch re-sent after its lease |
+| Kafka / Redis / PostgreSQL outage | Ingestion survives Kafka and Redis outages; Postgres outage → `503` + `Retry-After`, automatic recovery |
+| API horizontal scaling | 1 → 4 processes: 138–155 → 213–229 events/s, until the host CPU saturated |
+
+## What it does well
+
+- **Idempotent ingestion:** a tenant-scoped `Idempotency-Key` plus a normalized
+  request hash; a concurrent duplicate is resolved by a unique constraint (replay or `409`).
+- **At-least-once delivery, effectively-once processing:** a stable delivery ID,
+  leases with `attempt_count` as a **fencing token**, and duplicate messages
+  absorbed by a fenced claim.
+- **Failure handling:** retryable vs permanent classification, exponential backoff
+  with jitter, `Retry-After`, a poison-message guard, a **dead-letter queue with
+  audited replay**, a Kafka DLQ topic, and **per-endpoint circuit breakers** shared
+  through Redis.
+- **Multi-tenancy:** the tenant comes from the credential, composite foreign keys
+  enforce tenant boundaries in the schema, cross-tenant reads return `404`, and
+  ingestion is rate limited per tenant (GCRA in Redis Lua).
+- **Webhook security:** HMAC over `timestamp.body`, Fernet-encrypted secrets
+  shown once, an SSRF guard, no redirects.
+- **Templates:** logic-free `{{ payload.field }}` (no SSTI surface), rendered at
+  ingestion, so a missing field is a `422` up front.
+- **Operable:** Prometheus metrics (RED plus pipeline saturation, consumer lag
+  measured from outside the group), 10 alert rules, a Grafana dashboard as code,
+  JSON logs keyed by `request_id`, `/healthz` vs `/readyz`.
+- **Tested:** 137 tests against real PostgreSQL, Redis and Kafka in CI. CI fails if
+  any test is skipped, and checks migrations from scratch, the downgrade path, and
+  model drift.
 
 ## Documentation
 
 | Doc | What's in it |
 | --- | --- |
-| [docs/benchmarks.md](docs/benchmarks.md) | Load-test method, results, and the bottleneck investigation |
-| [docs/failure-experiments.md](docs/failure-experiments.md) | What happens when each dependency or component fails, tested live |
-| [docs/observability.md](docs/observability.md) | Metrics catalog, dashboard, alerts, logs, and a short runbook |
-| [docs/architecture.md](docs/architecture.md) | Requirements, lifecycle, reliability model, roadmap |
-| [docs/database.md](docs/database.md) | Schema, indexes, transactions, claim/completion SQL |
-| [docs/api.md](docs/api.md) | HTTP contract and error model |
-| [docs/build.md](docs/build.md) | Milestones and what's next |
+| [Engineering write-up](docs/engineering-writeup.md) | **Start here:** bottlenecks, experiments, wrong predictions, lessons |
+| [Architecture](docs/architecture.md) | Requirements, lifecycle, reliability model, Redis/Kafka designs, roadmap |
+| [Benchmarks](docs/benchmarks.md) | Every measurement, with method and the investigations behind it |
+| [Failure experiments](docs/failure-experiments.md) | What fails, what users see, what's retried, how it recovers, for each failure mode |
+| [Observability](docs/observability.md) | Metrics catalog, dashboard, alerts, logs, runbook |
+| [Deployment](docs/deployment.md) | Production topology, release process, configuration, sizing, checklist |
+| [API](docs/api.md) | HTTP contract, error model, dead-letter and admin endpoints |
+| [Database](docs/database.md) | Schema, indexes, transactions, claim/completion/outbox SQL |
+| [Build log](docs/build.md) | Milestones mapped to the learning plan |
 
 ## Quickstart
 
-**Everything in Docker:**
-
 ```sh
-docker compose up -d --build              # Postgres, Redis, Kafka, Mailpit, migrations, topics, API :8000, relay, consumer,
-                                          # Prometheus :9090, Grafana :3000 (dashboard: "Notification Platform")
-docker compose run --rm api python -m app.scripts.seed   # prints producer + admin keys ONCE
-docker compose logs -f worker
+docker compose up -d --build     # Postgres, Redis, Kafka, Mailpit, migrations, topics, API :8000,
+                                 # relay, consumer, Prometheus :9090, Grafana :3000
+./scripts/demo.sh                # narrated end-to-end demo (about 1 minute)
 ```
 
-The `migrate` service applies migrations and exits; the API and worker only start
-after it succeeds. In this mode, a webhook receiver running on your machine is
-reachable from the worker at `http://host.docker.internal:9123/...`, not `localhost`.
+The demo bootstraps a tenant, registers a template and a webhook (with a local
+receiver that verifies signatures), sends an event to three channels, shows
+idempotent replay and a `409`, follows delivery through the outbox and Kafka,
+lands a `410` in the dead-letter queue, trips the rate limiter, and prints the
+matching metrics. `vhs scripts/demo.tape` records it as a GIF.
 
-**Or run the API and worker from a virtualenv** (infrastructure only in Docker):
+Then open:
+- **Grafana:** http://localhost:3000 (dashboard "Notification Platform")
+- **Mailpit:** http://localhost:8025 (the delivered email)
+- **API docs:** http://localhost:8000/docs
+
+<details>
+<summary>Run the API and worker from a virtualenv instead</summary>
 
 ```sh
-docker compose up -d postgres redis mailpit   # Postgres :5433, Redis :6379, Mailpit :1025 (web UI :8025); add `kafka` for Kafka mode
-python -m venv .venv
-.venv/bin/pip install -r requirements.txt
+docker compose up -d postgres redis mailpit      # add kafka for DISPATCH_MODE=kafka
+python -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env
 .venv/bin/alembic upgrade head
-.venv/bin/python -m app.scripts.seed       # prints producer + admin keys ONCE
-.venv/bin/uvicorn app.main:app --reload    # API on :8000, docs at /docs
-.venv/bin/python -m app.workers.delivery_worker   # in another terminal
+.venv/bin/python -m app.scripts.seed             # prints producer + admin keys once
+.venv/bin/uvicorn app.main:app --reload          # API on :8000
+.venv/bin/python -m app.workers.delivery_worker  # in another terminal (Postgres polling mode)
 ```
 
-## End-to-end demo
-
-```sh
-PRODUCER=ntf_live_...   # from the seed output
-ADMIN=ntf_live_...
-USER_ID=$(docker exec notification-postgres psql -U notification_app -d notifications -tAc \
-  "select u.id from users u join tenants t on t.id=u.tenant_id where t.slug='demo' and external_id='ada'")
-
-# 1. Register a webhook endpoint (the secret is returned once)
-curl -s -X POST localhost:8000/v1/webhook-endpoints -H "Authorization: Bearer $ADMIN" \
-  -H 'Content-Type: application/json' -d '{"url":"http://localhost:9123/hooks"}'
-
-# 2. Run the reference receiver; it verifies signatures, and fails the first request to show a retry
-.venv/bin/python -m app.scripts.webhook_receiver --secret whsec_... --fail-first 1
-
-# 3. (Optional) Template the email; without one, the email body is the raw payload
-curl -s -X POST localhost:8000/v1/templates -H "Authorization: Bearer $ADMIN" \
-  -H 'Content-Type: application/json' -d '{"event_type":"order.paid","channel":"email",
-    "subject":"Order {{ subject.id }} is paid","body":"Hi {{ recipient.external_id }}, we received {{ payload.amount }} {{ payload.currency }}."}'
-
-# 4. Send an event to all three channels
-curl -s -X POST localhost:8000/v1/events -H "Authorization: Bearer $PRODUCER" \
-  -H 'Idempotency-Key: order-123-paid' -H 'Content-Type: application/json' -d "{
-    \"event_type\": \"order.paid\", \"subject\": {\"type\": \"order\", \"id\": \"ord_123\"},
-    \"payload\": {\"amount\": 4999, \"currency\": \"INR\"},
-    \"recipients\": [{\"user_id\": \"$USER_ID\", \"channels\": [\"email\", \"webhook\", \"in_app\"]}]}"
-
-# 5. Watch it land
-curl -s localhost:8000/v1/events/<event_id> -H "Authorization: Bearer $PRODUCER"
-curl -s localhost:8000/v1/users/$USER_ID/in-app-notifications -H "Authorization: Bearer $PRODUCER"
-open http://localhost:8025                 # the email in Mailpit
-.venv/bin/python -m app.scripts.stats      # queue depth, lag percentiles, retry rate
-```
-
-The webhook's first attempt gets a 503 and is retried after about 30 s. The
-attempt history is in `delivery_attempts`.
-
-`.env.example` sets `WEBHOOK_ALLOW_PRIVATE_NETWORKS=true` so a localhost
-receiver works. In any shared environment, set it to `false` and generate a new
-`WEBHOOK_SECRET_ENCRYPTION_KEY`.
+`.env.example` sets `WEBHOOK_ALLOW_PRIVATE_NETWORKS=true` so a local receiver
+works. In any shared environment set it to `false` and generate a new
+`WEBHOOK_SECRET_ENCRYPTION_KEY` (see [deployment.md](docs/deployment.md)).
+</details>
 
 ## Tests
 
@@ -156,13 +130,34 @@ TEST_DATABASE_URL=postgresql+psycopg://notification_app:local_dev_password@local
   .venv/bin/pytest -q
 ```
 
-There are 137 tests. Provider and retry unit tests run without a database; the
-integration tests (idempotency races, tenant isolation, leases, fencing, retries,
-webhooks, feed) are skipped unless `TEST_DATABASE_URL` is set. CI also checks the
-migration chain from scratch and that the models match it (`alembic check`).
+Provider and retry unit tests need nothing. Integration tests (idempotency
+races, tenant isolation, leases and fencing, retries, webhooks, Redis, Kafka,
+outages, metrics) skip when a service is missing locally. In CI, a skip fails
+the run.
 
-## Load test
+## Benchmarks and experiments
 
 ```sh
-.venv/bin/python -m benchmarks.load_test --events 1000 --recipients 3 --workers 4 --worker-batch 50
+python -m benchmarks.load_test --events 1000 --recipients 3 --workers 4 --worker-batch 50 --processes 4
+python -m benchmarks.load_test --dispatch kafka ...      # API must run with DISPATCH_MODE=kafka
+python -m benchmarks.query_count                         # DB round trips per request
+python -m benchmarks.blackhole_experiment                # circuit breaker vs a dead endpoint
+python -m app.scripts.stats                              # queue, Redis, outbox and lag health
+```
+
+## Project layout
+
+```
+app/
+  api/            routes, auth (cached, rate limited), admin, feed, dead letters, pagination
+  events/         idempotent ingestion + transactional fan-out + template rendering
+  notifications/  retry policy, derived status, templates, dead-letter redrive
+  providers/      SMTP, webhook (HMAC, SSRF guard), in-app, fake email
+  workers/        polling worker, outbox relay, Kafka consumer
+  cache.py  ratelimit.py  circuit.py  messaging.py  metrics.py  logging_config.py
+alembic/          frozen-DDL migrations
+benchmarks/       load test, query counter, black-hole experiment
+observability/    Prometheus config, alert rules, Grafana provisioning, dashboard generator
+scripts/          demo.sh, demo.tape
+tests/            unit + integration (Postgres, Redis, Kafka)
 ```
