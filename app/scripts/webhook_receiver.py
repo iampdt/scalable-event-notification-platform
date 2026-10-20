@@ -5,6 +5,7 @@
 It verifies the HMAC signature, rejects stale timestamps (replay protection),
 and de-duplicates by delivery ID because the platform delivers at-least-once.
 --fail-first N answers 503 to the first N requests to demonstrate retries.
+Any path ending in /gone answers 410 (a permanent failure: shows the dead-letter queue).
 """
 from __future__ import annotations
 
@@ -35,6 +36,8 @@ def make_handler(secret: str, fail_first: int):
                 return self.reply(400, "stale timestamp")
             if not hmac.compare_digest(sign_webhook(secret, timestamp, body), self.headers.get("X-Notification-Signature", "")):
                 return self.reply(401, "bad signature")
+            if self.path.endswith("/gone"):
+                return self.reply(410, "endpoint gone")
             if state["remaining_failures"] > 0:
                 state["remaining_failures"] -= 1
                 return self.reply(503, "simulated outage")
