@@ -17,6 +17,7 @@ x-app: &app
     REDIS_URL: redis://redis:6379/0
     KAFKA_BOOTSTRAP_SERVERS: kafka:29092
     DISPATCH_MODE: kafka
+    LOG_FORMAT: json
 
 services:
   postgres:
@@ -132,6 +133,9 @@ services:
   relay:
     <<: *app
     command: ["python", "-m", "app.workers.outbox_relay"]
+    environment:
+      <<: *app-env
+      METRICS_PORT: "9101"
     restart: unless-stopped
     stop_grace_period: 30s
     depends_on:
@@ -143,6 +147,9 @@ services:
   worker:
     <<: *app
     command: ["python", "-m", "app.workers.kafka_consumer"]
+    environment:
+      <<: *app-env
+      METRICS_PORT: "9102"
     restart: unless-stopped
     # SIGTERM lets the worker finish its in-flight batch and leave the consumer group.
     stop_grace_period: 30s
@@ -151,6 +158,36 @@ services:
         condition: service_completed_successfully
       kafka-init:
         condition: service_completed_successfully
+
+  # Observability: Prometheus scrapes the API (/metrics), relay (:9101) and
+  # workers (:9102); Grafana is provisioned with the data source and dashboard.
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: notification-prometheus
+    restart: unless-stopped
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=7d"]
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: notification-grafana
+    restart: unless-stopped
+    environment:
+      # Local only: anonymous read access, so the dashboard opens without a login.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/notification-platform.json
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
 
 volumes:
   postgres_data:
