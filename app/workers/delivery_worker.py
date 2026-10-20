@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import random
 import signal
 import time
 import uuid
@@ -18,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, insert, text, update
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
+from app import circuit
 from app.config import dispatch_mode, email_provider_name, webhook_timeout_seconds
 from app.db.models import Delivery, DeliveryAttempt, DeliveryChannel, DeliveryStatus, OutboxMessage
 from app.messaging import delivery_message
@@ -95,7 +97,7 @@ CLAIM_IDS_SQL = text(
 # Everything an adapter needs, loaded in the claim transaction so adapters stay DB-free.
 JOB_SQL = text(
     """
-    SELECT d.id, d.tenant_id, d.channel, d.target_snapshot, d.content, d.attempt_count, d.max_attempts,
+    SELECT d.id, d.tenant_id, d.channel, d.target_snapshot, d.content, d.attempt_count, d.max_attempts, d.webhook_endpoint_id,
            n.id AS notification_id, u.id AS user_id, u.external_id,
            e.id AS event_id, e.event_type, e.subject_type, e.subject_id, e.payload, e.created_at AS occurred_at,
            w.active AS webhook_active, w.secret_ciphertext
@@ -121,6 +123,8 @@ class Outcome:
     completed_at: datetime
     status_code: int | None = None
     failure: ProviderFailure | None = None
+    # Set when a circuit breaker refused the send: retry later, no attempt spent.
+    deferred_seconds: float | None = None
 
 
 class DeliveryWorker:
@@ -203,6 +207,7 @@ class DeliveryWorker:
                 payload=row.payload,
                 occurred_at=row.occurred_at,
                 webhook_active=row.webhook_active,
+                webhook_endpoint_id=row.webhook_endpoint_id,
                 webhook_secret_ciphertext=row.secret_ciphertext,
             )
             for row in rows
@@ -216,6 +221,8 @@ class DeliveryWorker:
         has moved on, zero rows match, and our late result is dropped.
         """
         claimed, failure = outcome.claimed, outcome.failure
+        if outcome.deferred_seconds is not None:
+            return self._defer(session, outcome)
         if failure is None:
             values = {"status": DeliveryStatus.delivered, "delivered_at": func.now(), "last_error_code": None}
             attempt = {"outcome": "success", "provider_status_code": outcome.status_code}
@@ -247,6 +254,24 @@ class DeliveryWorker:
             # the same transaction as the state change.
             session.execute(insert(OutboxMessage).values(**delivery_message(claimed.id, claimed.tenant_id, available_at=values["next_attempt_at"])))
         return True
+
+    def _defer(self, session, outcome: Outcome) -> bool:
+        """Circuit open: hand the attempt back (attempt_count - 1) and retry later.
+
+        Burning retries against a target we already know is down would push
+        healthy-but-unlucky deliveries into the dead-letter queue.
+        """
+        claimed = outcome.claimed
+        next_attempt_at = func.now() + timedelta(seconds=outcome.deferred_seconds)
+        updated = session.execute(
+            update(Delivery)
+            .where(Delivery.id == claimed.id, Delivery.status == DeliveryStatus.processing, Delivery.attempt_count == claimed.attempt_count)
+            .values(status=DeliveryStatus.pending, attempt_count=Delivery.attempt_count - 1, next_attempt_at=next_attempt_at, lease_expires_at=None, updated_at=func.now())
+            .returning(Delivery.id)
+        ).first()
+        if updated and dispatch_mode() == "kafka":
+            session.execute(insert(OutboxMessage).values(**delivery_message(claimed.id, claimed.tenant_id, available_at=next_attempt_at)))
+        return bool(updated)
 
     def complete(self, outcomes: list[Outcome]) -> list[bool]:
         """Record a whole batch in ONE transaction.
@@ -282,19 +307,41 @@ class DeliveryWorker:
         now = datetime.now(timezone.utc)
         return self.complete([Outcome(claimed, started_at or now, now, failure=failure)])[0]
 
+    def circuit_scope(self, claimed: ClaimedDelivery) -> str | None:
+        """One breaker per webhook endpoint / email provider; in-app has nothing to protect."""
+        if claimed.channel == DeliveryChannel.webhook and claimed.webhook_endpoint_id:
+            return f"webhook:{claimed.webhook_endpoint_id}"
+        if claimed.channel == DeliveryChannel.email:
+            return f"email:{type(self.providers[DeliveryChannel.email]).__name__}"
+        return None
+
     def attempt(self, claimed: ClaimedDelivery) -> Outcome:
         """Call the provider. No database access here, by design."""
         started_at = datetime.now(timezone.utc)
+        scope = self.circuit_scope(claimed)
+        permit = circuit.before(scope) if scope else circuit.ALLOW
+        if not permit.allowed:
+            # Jitter spreads the deferred deliveries so they don't all return at
+            # the instant the circuit half-opens.
+            return Outcome(claimed, started_at, started_at, deferred_seconds=permit.retry_after_seconds + random.uniform(0, 5))
         try:
             status_code = self.providers[claimed.channel].send(claimed)
-            return Outcome(claimed, started_at, datetime.now(timezone.utc), status_code=status_code)
+            outcome = Outcome(claimed, started_at, datetime.now(timezone.utc), status_code=status_code)
+            healthy = True
         except ProviderFailure as failure:
-            return Outcome(claimed, started_at, datetime.now(timezone.utc), failure=failure)
+            outcome = Outcome(claimed, started_at, datetime.now(timezone.utc), failure=failure)
+            # Only "is the target up?" failures count; a 4xx means it answered.
+            healthy = not failure.retryable
         except Exception:
             # Bugs or unexpected library errors: retry rather than lose the message,
             # and keep the exception detail in logs rather than in the attempt row.
             logger.exception("provider_crashed delivery_id=%s channel=%s", claimed.id, claimed.channel.value)
             return Outcome(claimed, started_at, datetime.now(timezone.utc), failure=ProviderFailure("internal provider error", retryable=True))
+        if scope:
+            transition = circuit.after(scope, permit, healthy)
+            if transition:
+                logger.warning("circuit_%s scope=%s", transition, scope)
+        return outcome
 
     def deliver(self, claimed: ClaimedDelivery) -> bool:
         return self.complete([self.attempt(claimed)])[0]
