@@ -147,3 +147,34 @@ def test_email_message_carries_stable_delivery_id():
     message = build_message(delivery, "from@example.test")
     assert message["Message-ID"] == f"<{delivery.id}@notifications.local>"
     assert message["To"] == "ada@example.test"
+
+
+def test_template_renders_dotted_lookups_strictly():
+    from app.notifications.templates import TemplateError, render
+
+    context = {"event_type": "order.paid", "subject": {"type": "order", "id": "o1"}, "payload": {"amount": 4999, "items": [{"sku": "A1"}], "gift": True, "note": None, "meta": {"a": 1}}, "recipient": {"external_id": "ada", "email": None}}
+    assert render("Hi {{ recipient.external_id }}, {{payload.amount}} for {{ subject.id }}", context) == "Hi ada, 4999 for o1"
+    assert render("{{ payload.items.0.sku }} {{ payload.gift }} [{{ payload.note }}] {{ payload.meta }}", context) == 'A1 true [] {"a":1}'
+    with pytest.raises(TemplateError, match="payload.missing"):
+        render("{{ payload.missing }}", context)
+    with pytest.raises(TemplateError, match="64 KiB"):
+        render("{{ payload.meta }}" * 20000, context)
+
+
+@pytest.mark.parametrize("bad", ["{{ config.SECRET }}", "{{ payload.a | upper }}", "{{ payload.__class__ }}x}}", "{% for x in y %}{{ payload.a }}", "{{ payload.amount"])
+def test_template_rejects_anything_but_simple_lookups(bad):
+    from app.notifications.templates import TemplateError, placeholders
+
+    if "{%" in bad:
+        # Not a placeholder at all: harmless literal text, rendered verbatim.
+        assert placeholders(bad) == ["payload.a"]
+        return
+    with pytest.raises(TemplateError):
+        placeholders(bad)
+
+
+def test_email_uses_rendered_content_when_present():
+    delivery = ClaimedDelivery(id=uuid.uuid4(), tenant_id=uuid.uuid4(), channel=DeliveryChannel.email, target_snapshot={"email": "ada@example.test"}, attempt_count=1, max_attempts=5, event_type="order.paid", content={"subject": "Paid: o1", "body": "Thanks ada"})
+    message = build_message(delivery, "from@example.test")
+    assert message["Subject"] == "Paid: o1"
+    assert message.get_content().strip() == "Thanks ada"

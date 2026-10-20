@@ -31,6 +31,9 @@ flowchart LR
   against stale workers.
 - **Retry policy:** retryable vs permanent classification, exponential backoff
   with jitter, `Retry-After`, 5 attempts.
+- **Templates:** tenant-authored, logic-free `{{ payload.field }}` templates for
+  email and in-app, rendered at ingestion, so a missing field is a `422` for the
+  producer instead of a broken email later.
 - **Webhook security:** HMAC over `timestamp.body`, Fernet-encrypted secrets,
   SSRF guard, no redirects.
 - **Load-tested:** ingest p95 under 250 ms; about 1,700 deliveries/s with 4 workers on a
@@ -49,8 +52,22 @@ flowchart LR
 
 ## Quickstart
 
+**Everything in Docker:**
+
 ```sh
-docker compose up -d                      # Postgres on :5433, Mailpit on :1025 (web UI :8025)
+docker compose up -d --build              # Postgres, Mailpit, migrations, API on :8000, worker
+docker compose run --rm api python -m app.scripts.seed   # prints producer + admin keys ONCE
+docker compose logs -f worker
+```
+
+The `migrate` service applies migrations and exits; the API and worker only start
+after it succeeds. In this mode, a webhook receiver running on your machine is
+reachable from the worker at `http://host.docker.internal:9123/...`, not `localhost`.
+
+**Or run the API and worker from a virtualenv** (infrastructure only in Docker):
+
+```sh
+docker compose up -d postgres mailpit     # Postgres on :5433, Mailpit on :1025 (web UI :8025)
 python -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp .env.example .env
@@ -75,14 +92,19 @@ curl -s -X POST localhost:8000/v1/webhook-endpoints -H "Authorization: Bearer $A
 # 2. Run the reference receiver; it verifies signatures, and fails the first request to show a retry
 .venv/bin/python -m app.scripts.webhook_receiver --secret whsec_... --fail-first 1
 
-# 3. Send an event to all three channels
+# 3. (Optional) Template the email; without one, the email body is the raw payload
+curl -s -X POST localhost:8000/v1/templates -H "Authorization: Bearer $ADMIN" \
+  -H 'Content-Type: application/json' -d '{"event_type":"order.paid","channel":"email",
+    "subject":"Order {{ subject.id }} is paid","body":"Hi {{ recipient.external_id }}, we received {{ payload.amount }} {{ payload.currency }}."}'
+
+# 4. Send an event to all three channels
 curl -s -X POST localhost:8000/v1/events -H "Authorization: Bearer $PRODUCER" \
   -H 'Idempotency-Key: order-123-paid' -H 'Content-Type: application/json' -d "{
     \"event_type\": \"order.paid\", \"subject\": {\"type\": \"order\", \"id\": \"ord_123\"},
     \"payload\": {\"amount\": 4999, \"currency\": \"INR\"},
     \"recipients\": [{\"user_id\": \"$USER_ID\", \"channels\": [\"email\", \"webhook\", \"in_app\"]}]}"
 
-# 4. Watch it land
+# 5. Watch it land
 curl -s localhost:8000/v1/events/<event_id> -H "Authorization: Bearer $PRODUCER"
 curl -s localhost:8000/v1/users/$USER_ID/in-app-notifications -H "Authorization: Bearer $PRODUCER"
 open http://localhost:8025                 # the email in Mailpit
@@ -104,7 +126,7 @@ TEST_DATABASE_URL=postgresql+psycopg://notification_app:local_dev_password@local
   .venv/bin/pytest -q
 ```
 
-There are 61 tests. Provider and retry unit tests run without a database; the
+There are 90 tests. Provider and retry unit tests run without a database; the
 integration tests (idempotency races, tenant isolation, leases, fencing, retries,
 webhooks, feed) are skipped unless `TEST_DATABASE_URL` is set. CI also checks the
 migration chain from scratch and that the models match it (`alembic check`).

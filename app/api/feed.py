@@ -19,7 +19,7 @@ router = APIRouter(prefix="/v1")
 
 
 def feed_item(delivery: Delivery, notification: Notification, event: Event) -> dict:
-    return {"delivery_id": str(delivery.id), "notification_id": str(notification.id), "event_type": event.event_type, "subject": {"type": event.subject_type, "id": event.subject_id}, "payload": event.payload, "read_at": delivery.read_at.isoformat() if delivery.read_at else None, "created_at": notification.created_at.isoformat()}
+    return {"delivery_id": str(delivery.id), "notification_id": str(notification.id), "event_type": event.event_type, "subject": {"type": event.subject_type, "id": event.subject_id}, "title": (delivery.content or {}).get("subject"), "body": (delivery.content or {}).get("body"), "payload": event.payload, "read_at": delivery.read_at.isoformat() if delivery.read_at else None, "created_at": notification.created_at.isoformat()}
 
 
 @router.get("/users/{user_id}/in-app-notifications")
