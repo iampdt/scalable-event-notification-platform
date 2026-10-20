@@ -196,12 +196,59 @@ PostgreSQL, so durability would only cost write latency.
 | Component | Add only when evidence shows | Benefit |
 | --- | --- | --- |
 | Redis | Measured caching, rate-limiting, or coordination need. **Added:** rate limiting closes the "one tenant can fill the queue" gap; caching removed 3 of 9 round trips per ingest. | Speeds a specific transient concern; Postgres remains source of truth. |
-| Kafka | Independent consumers need replay/decoupling or the DB queue has measured throughput limits. | Use transactional outbox publishing; consumers remain idempotent. |
+| Kafka | Independent consumers need replay/decoupling. **Added as an optional dispatch mode.** Measured: no throughput gain while Postgres remains the system of record (see correction below). | Use transactional outbox publishing; consumers remain idempotent. |
 | Separate services | Independent scaling/deployment/isolation has a demonstrated benefit. | Replaces the in-process worker boundary. |
 | Kubernetes | Multiple services/environments need scheduling and autoscaling. | Replaces manual Compose operations. |
 
 Never dual-write an API request to PostgreSQL and Kafka. When Kafka is warranted,
-write event plus outbox row in one transaction, then publish the outbox.
+write event plus outbox row in one transaction, then publish the outbox. (That's
+what the Kafka dispatch mode below does.)
+
+**Correction (measured).** This roadmap originally named the Postgres queue's
+throughput ceiling as the trigger for Kafka. The benchmark disproved that: Kafka
+dispatch *matched* polling on latency but did not add throughput, because the
+ceiling is the per-delivery state writes in PostgreSQL, which stay with Kafka
+too (plus an outbox insert and delete). Kafka is worth its complexity for
+decoupling, replay, buffering and push delivery, not for raw throughput while
+PostgreSQL stays the system of record. See [benchmarks.md](benchmarks.md#kafka-vs-postgres-dispatch-plan-step-3).
+
+## Kafka dispatch (`DISPATCH_MODE=kafka`)
+
+```mermaid
+sequenceDiagram
+  participant API
+  participant PG as PostgreSQL
+  participant R as Outbox relay
+  participant K as Kafka
+  participant C as Consumer (group)
+  API->>PG: BEGIN; event + deliveries + outbox rows; COMMIT
+  API-->>API: 202
+  R->>PG: lock due outbox rows (SKIP LOCKED)
+  R->>K: produce (acks=all, idempotent)
+  K-->>R: acks
+  R->>PG: delete acked rows; COMMIT
+  C->>K: consume batch
+  C->>PG: UPDATE … WHERE id = ANY(ids) AND status='pending' (fenced claim)
+  C->>C: send via providers (no transaction)
+  C->>PG: record outcomes (+ outbox row for each retry); COMMIT
+  C->>K: commit offsets
+```
+
+| Concern | Design |
+| --- | --- |
+| Atomicity | Outbox rows are written in the ingestion transaction. Kafka is never written directly from a request. |
+| Message | A pointer (`{"delivery_id", "tenant_id"}`, key = `delivery_id`). The consumer reads authoritative state from PostgreSQL. |
+| Duplicates | Expected: relay crash after ack, consumer crash before offset commit, rebalances. The fenced claim (`status = 'pending'`) turns a duplicate into a no-op. |
+| Retries | Kafka has no delayed delivery, so a retry is an outbox row with `available_at = next_attempt_at`. PostgreSQL schedules; Kafka transports. |
+| Consumer crash | Uncommitted offsets are redelivered to another group member; rows it had claimed keep their lease until the relay's sweeper re-queues them. |
+| Poison | A malformed message is logged and skipped. A delivery that kills consumers is failed after `max_attempts` (`worker_lost`). An outbox row that can't be published backs off on its own, without blocking others. |
+| Ordering | Not guaranteed (non-goal). Keying by `delivery_id` spreads load evenly across the 12 partitions. |
+
+**Kafka failure behaviour (verified live).** With the broker stopped, ingestion
+kept returning `202`. Deliveries waited in the outbox while the relay backed off
+(one `publish_failed` log line), and after the broker restarted the outbox
+drained and every delivery completed. Nothing was lost and no request failed.
+This is the main operational argument for the outbox.
 
 ## Validation plan
 

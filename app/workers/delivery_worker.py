@@ -10,6 +10,7 @@ import logging
 import math
 import signal
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -17,8 +18,9 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, insert, text, update
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.config import email_provider_name, webhook_timeout_seconds
-from app.db.models import Delivery, DeliveryAttempt, DeliveryChannel, DeliveryStatus
+from app.config import dispatch_mode, email_provider_name, webhook_timeout_seconds
+from app.db.models import Delivery, DeliveryAttempt, DeliveryChannel, DeliveryStatus, OutboxMessage
+from app.messaging import delivery_message
 from app.db.session import SessionLocal
 from app.notifications.retry import ProviderFailure, retry_delay_seconds
 from app.providers.base import ClaimedDelivery, Provider
@@ -74,6 +76,21 @@ FAIL_ABANDONED_SQL = text(
     """
 )
 CLAIM_DUE_SQL = text(CLAIM_TEMPLATE.format(status="pending", due_column="next_attempt_at", comparison="<=", extra=""))
+
+# Kafka mode: claim exactly the deliveries named by consumed messages. The WHERE
+# clause makes duplicate or early messages harmless: a row that is already
+# processing/delivered, or whose retry is not due yet, is simply not returned.
+CLAIM_IDS_SQL = text(
+    """
+    UPDATE deliveries
+    SET status = 'processing',
+        attempt_count = attempt_count + 1,
+        lease_expires_at = now() + make_interval(secs => :lease_seconds),
+        updated_at = now()
+    WHERE id = ANY(:ids) AND status = 'pending' AND next_attempt_at <= now()
+    RETURNING id
+    """
+)
 
 # Everything an adapter needs, loaded in the claim transaction so adapters stay DB-free.
 JOB_SQL = text(
@@ -154,29 +171,42 @@ class DeliveryWorker:
             ids = reclaimed + due
             if not ids:
                 return []
-            rows = session.execute(JOB_SQL, {"ids": ids}).all()
-            return [
-                ClaimedDelivery(
-                    id=row.id,
-                    tenant_id=row.tenant_id,
-                    channel=DeliveryChannel(row.channel),
-                    target_snapshot=row.target_snapshot,
-                    content=row.content,
-                    attempt_count=row.attempt_count,
-                    max_attempts=row.max_attempts,
-                    notification_id=row.notification_id,
-                    user_id=row.user_id,
-                    user_external_id=row.external_id,
-                    event_id=row.event_id,
-                    event_type=row.event_type,
-                    subject={"type": row.subject_type, "id": row.subject_id},
-                    payload=row.payload,
-                    occurred_at=row.occurred_at,
-                    webhook_active=row.webhook_active,
-                    webhook_secret_ciphertext=row.secret_ciphertext,
-                )
-                for row in rows
-            ]
+            return self._load_jobs(session, ids)
+
+    def claim_ids(self, ids: list[uuid.UUID]) -> list[ClaimedDelivery]:
+        """Kafka mode: claim the deliveries named by consumed messages (duplicates drop out)."""
+        if not ids:
+            return []
+        with SessionLocal.begin() as session:
+            claimed = [row.id for row in session.execute(CLAIM_IDS_SQL, {"ids": ids, "lease_seconds": self.lease_seconds})]
+            if len(claimed) < len(set(ids)):
+                logger.info("duplicate_or_not_due_messages_skipped count=%s", len(set(ids)) - len(claimed))
+            return self._load_jobs(session, claimed) if claimed else []
+
+    def _load_jobs(self, session, ids: list[uuid.UUID]) -> list[ClaimedDelivery]:
+        rows = session.execute(JOB_SQL, {"ids": ids}).all()
+        return [
+            ClaimedDelivery(
+                id=row.id,
+                tenant_id=row.tenant_id,
+                channel=DeliveryChannel(row.channel),
+                target_snapshot=row.target_snapshot,
+                content=row.content,
+                attempt_count=row.attempt_count,
+                max_attempts=row.max_attempts,
+                notification_id=row.notification_id,
+                user_id=row.user_id,
+                user_external_id=row.external_id,
+                event_id=row.event_id,
+                event_type=row.event_type,
+                subject={"type": row.subject_type, "id": row.subject_id},
+                payload=row.payload,
+                occurred_at=row.occurred_at,
+                webhook_active=row.webhook_active,
+                webhook_secret_ciphertext=row.secret_ciphertext,
+            )
+            for row in rows
+        ]
 
     def _apply(self, session, outcome: Outcome) -> bool:
         """Fenced state transition + attempt row for one outcome.
@@ -195,7 +225,8 @@ class DeliveryWorker:
             retry = failure.retryable and claimed.attempt_count < claimed.max_attempts
             values = {"last_error_code": str(failure.status_code or ("retryable_failure" if failure.retryable else "permanent_failure"))}
             if retry:
-                values.update(status=DeliveryStatus.pending, failed_at=None, next_attempt_at=func.now() + timedelta(seconds=retry_delay_seconds(claimed.attempt_count, failure.retry_after)))
+                next_attempt_at = func.now() + timedelta(seconds=retry_delay_seconds(claimed.attempt_count, failure.retry_after))
+                values.update(status=DeliveryStatus.pending, failed_at=None, next_attempt_at=next_attempt_at)
             else:
                 values.update(status=DeliveryStatus.failed, failed_at=func.now())
             attempt = {"outcome": "retryable_failure" if failure.retryable else "permanent_failure", "provider_status_code": failure.status_code, "provider_message": str(failure)[:512]}
@@ -210,6 +241,11 @@ class DeliveryWorker:
             logger.warning("stale_completion_dropped delivery_id=%s attempt=%s", claimed.id, claimed.attempt_count)
             return False
         session.execute(insert(DeliveryAttempt).values(tenant_id=claimed.tenant_id, delivery_id=claimed.id, attempt_number=claimed.attempt_count, started_at=outcome.started_at, completed_at=outcome.completed_at, **attempt))
+        if values.get("status") == DeliveryStatus.pending and dispatch_mode() == "kafka":
+            # Kafka has no delayed delivery, so the retry is scheduled here: an
+            # outbox row that becomes publishable at next_attempt_at, written in
+            # the same transaction as the state change.
+            session.execute(insert(OutboxMessage).values(**delivery_message(claimed.id, claimed.tenant_id, available_at=values["next_attempt_at"])))
         return True
 
     def complete(self, outcomes: list[Outcome]) -> list[bool]:
@@ -263,8 +299,14 @@ class DeliveryWorker:
     def deliver(self, claimed: ClaimedDelivery) -> bool:
         return self.complete([self.attempt(claimed)])[0]
 
+    def process_ids(self, ids: list[uuid.UUID], executor: ThreadPoolExecutor | None = None) -> int:
+        """Kafka mode: claim, send, and record the deliveries named by a consumed batch."""
+        return self._process(self.claim_ids(ids), executor)
+
     def run_once(self, batch_size: int = 10, executor: ThreadPoolExecutor | None = None) -> int:
-        claimed = self.claim(batch_size)
+        return self._process(self.claim(batch_size), executor)
+
+    def _process(self, claimed: list[ClaimedDelivery], executor: ThreadPoolExecutor | None) -> int:
         if executor is None or len(claimed) <= 1:
             outcomes = [self.attempt(delivery) for delivery in claimed]
         else:

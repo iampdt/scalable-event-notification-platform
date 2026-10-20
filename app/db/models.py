@@ -10,7 +10,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, CheckConstraint, LargeBinary, Numeric, DateTime, Enum, ForeignKey, ForeignKeyConstraint, Index, Integer, Text, UniqueConstraint, func, text
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, LargeBinary, Numeric, DateTime, Enum, ForeignKey, ForeignKeyConstraint, Index, Integer, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -180,6 +180,24 @@ class DeliveryAttempt(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class OutboxMessage(Base):
+    """Transactional outbox: written with the state change, published by the relay, then deleted."""
+
+    __tablename__ = "outbox"
+    __table_args__ = (CheckConstraint("jsonb_typeof(payload) = 'object'", name="outbox_payload_is_object"),)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    topic: Mapped[str] = mapped_column(Text)
+    message_key: Mapped[str] = mapped_column(Text)
+    payload: Mapped[dict] = mapped_column(JSONB)
+    aggregate_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    publish_attempts: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
+Index("idx_outbox_available", OutboxMessage.available_at, OutboxMessage.id)
+Index("idx_outbox_aggregate", OutboxMessage.aggregate_id)
 Index("one_active_default_webhook_per_tenant", WebhookEndpoint.tenant_id, unique=True, postgresql_where=WebhookEndpoint.active & WebhookEndpoint.is_default)
 Index("idx_api_keys_active", ApiKey.key_prefix, postgresql_where=ApiKey.revoked_at.is_(None))
 Index("idx_events_tenant_created", Event.tenant_id, Event.created_at.desc())

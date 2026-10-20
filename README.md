@@ -8,7 +8,9 @@ recovery, idempotency, and strict tenant isolation.
 Built as a modular monolith on **FastAPI + PostgreSQL + Redis**. Postgres is both
 the source of truth and the job queue (`FOR UPDATE SKIP LOCKED`). Redis is an
 optional accelerator for caching and per-tenant rate limiting: the platform keeps
-working if it's down. No Kafka until a measurement says otherwise.
+working if it's down. **Kafka** is an alternative dispatch path
+(`DISPATCH_MODE=kafka`): a transactional outbox, a relay, and a consumer group.
+Ingestion keeps working even while Kafka is down.
 
 ```mermaid
 flowchart LR
@@ -16,7 +18,10 @@ flowchart LR
   API -->|one transaction:<br/>event + notifications + deliveries| DB[(PostgreSQL<br/>state + queue)]
   API -->|202 after commit| P
   API <-.->|cache + rate limit<br/>fail-open| R[(Redis)]
-  W[Workers xN] -->|SKIP LOCKED claim + lease| DB
+  DB -->|outbox rows| RL[Outbox relay]
+  RL -->|publish| K[[Kafka topic<br/>notification.deliveries.v1]]
+  K -->|consumer group| W[Workers xN]
+  W -->|fenced claim in Postgres| DB
   W -->|SMTP| M[Email / Mailpit]
   W -->|HMAC-signed POST| H[Tenant webhook]
   W -->|mark delivered| F[In-app feed]
@@ -39,6 +44,11 @@ flowchart LR
 - **Redis cache-aside:** credentials and templates are cached, cutting database
   round trips per ingest from 9 to 6 and per authenticated read from 3 to 1.
   A Redis outage degrades to "no cache, no limit", not to errors.
+- **Kafka with a transactional outbox:** no dual write. Messages are pointers
+  claimed in Postgres, so duplicates are harmless. Measured honestly: Kafka
+  matched Postgres polling on latency and did *not* add throughput, because the
+  ceiling is database state writes. Its value here is push instead of polling,
+  replay, buffering, and room for more consumers.
 - **Templates:** tenant-authored, logic-free `{{ payload.field }}` templates for
   email and in-app, rendered at ingestion, so a missing field is a `422` for the
   producer instead of a broken email later.
@@ -63,7 +73,7 @@ flowchart LR
 **Everything in Docker:**
 
 ```sh
-docker compose up -d --build              # Postgres, Redis, Mailpit, migrations, API on :8000, worker
+docker compose up -d --build              # Postgres, Redis, Kafka, Mailpit, migrations, topics, API :8000, relay, consumer
 docker compose run --rm api python -m app.scripts.seed   # prints producer + admin keys ONCE
 docker compose logs -f worker
 ```
@@ -75,7 +85,7 @@ reachable from the worker at `http://host.docker.internal:9123/...`, not `localh
 **Or run the API and worker from a virtualenv** (infrastructure only in Docker):
 
 ```sh
-docker compose up -d postgres redis mailpit   # Postgres :5433, Redis :6379, Mailpit :1025 (web UI :8025)
+docker compose up -d postgres redis mailpit   # Postgres :5433, Redis :6379, Mailpit :1025 (web UI :8025); add `kafka` for Kafka mode
 python -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp .env.example .env
@@ -134,7 +144,7 @@ TEST_DATABASE_URL=postgresql+psycopg://notification_app:local_dev_password@local
   .venv/bin/pytest -q
 ```
 
-There are 100 tests. Provider and retry unit tests run without a database; the
+There are 112 tests. Provider and retry unit tests run without a database; the
 integration tests (idempotency races, tenant isolation, leases, fencing, retries,
 webhooks, feed) are skipped unless `TEST_DATABASE_URL` is set. CI also checks the
 migration chain from scratch and that the models match it (`alembic check`).

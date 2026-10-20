@@ -67,3 +67,15 @@ def db_pool_settings() -> dict:
         "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "10")),
         "pool_timeout": float(os.getenv("DB_POOL_TIMEOUT_SECONDS", "5")),
     }
+
+
+def dispatch_mode() -> str:
+    """How deliveries reach workers: "postgres" (SKIP LOCKED polling) or "kafka" (outbox -> Kafka)."""
+    mode = os.getenv("DISPATCH_MODE", "postgres")
+    if mode not in ("postgres", "kafka"):
+        raise RuntimeError(f"DISPATCH_MODE must be 'postgres' or 'kafka', not {mode!r}")
+    return mode
+
+
+def kafka_bootstrap_servers() -> str:
+    return os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")

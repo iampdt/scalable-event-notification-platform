@@ -146,6 +146,58 @@ tenant.
 while down), one `redis_unavailable … bypassing for 5.0s` log line, and every
 delivery completed.
 
+## Kafka vs Postgres dispatch (plan step 3)
+
+Measured 2026-10-20/21 with the same laptop setup, plus a single-node Kafka 3.9
+(KRaft) in Docker. Workload: 1,000–1,500 events × 3 recipients × 2 channels.
+Kafka mode runs **1 relay + 4 consumers**; Postgres mode runs **4 polling workers**.
+Batch 50 everywhere.
+
+### Final comparison
+
+| Scenario | Postgres polling | Kafka (outbox → relay → consumers) |
+| --- | --- | --- |
+| Backlog drain, workers started cold | 1,307–1,463 deliveries/s | 745–862 deliveries/s (includes ~2 s consumer-group join) |
+| Backlog drain, **consumers already warm** | — | **1,240 deliveries/s** (full 48–50-message batches) |
+| Light steady load (2 workers), lag p95 | 0.39 s | **0.49 s** (was 3.27 s before a fix) |
+| Saturated ingest, warm group, lag p95 | 0.47 s | **0.43 s** |
+| Ingest throughput (API on the same laptop) | 118–203 events/s | 101–169 events/s |
+
+**Conclusion.** Warm Kafka dispatch is about as fast as Postgres polling, and no
+faster. Every delivery still costs the same PostgreSQL claim and completion
+writes, *plus* an outbox insert and delete, plus a Kafka round trip and an offset
+commit. The ceiling is database state writes, and Kafka doesn't remove them. The
+earlier roadmap's throughput justification for Kafka was **wrong**, and the docs
+were corrected. Kafka's real benefits here: push delivery (idle workers stop
+polling the database), 7-day replay, buffering during outages, and room for more
+consumer groups.
+
+### The investigation (Kafka started out much slower)
+
+| Step | Observation | Cause | Fix | Result |
+| --- | --- | --- | --- | --- |
+| 1 | Backlog drain 778–825/s vs 1,300–1,460/s; steady lag p95 3.27 s vs 0.39 s | — | — | Kafka slower everywhere |
+| 2 | Per-partition offsets: each run's messages on exactly **3 of 12** partitions | Key `tenant:user` with a 3-recipient workload means only 3 consumers can work | Key by `delivery_id` (ordering is a non-goal anyway) | Even spread; throughput unchanged, so not the bottleneck |
+| 3 | Light-load lag ~1 s+ per batch | `consume(50, timeout=1.0)` waits up to 1 s to *fill* a batch | Two-phase fetch: block for the first message, then take only what's buffered | Steady lag p95 3.27 → **0.49 s** |
+| 4 | Sampling outbox vs pending: relay drained 6,000 rows in **< 1 s**, then ~2 s with nothing consumed | Consumers joining one by one trigger eager stop-the-world rebalances | `partition.assignment.strategy=cooperative-sticky`; measure warm | Warm backlog **1,240/s** |
+| 5 | Consumer batch size under moderate load: 13–15 messages (poller: 50) | Two-phase fetch takes only what's buffered | Accepted: low latency at light load; batches fill under backlog (48–50) | — |
+
+Two measurements were discarded as invalid and are recorded here so they aren't
+reused:
+- A "warm backlog" run where the load test also spawned its own relay, so the
+  backlog never formed (it reported a meaningless 27,000/s).
+- The first warm runs, where consumers started at the same instant as ingest, so
+  rebalancing overlapped the traffic.
+
+### Kafka outage (Docker stack, live)
+
+10 events with Kafka up, then `docker compose stop kafka` and 10 more:
+**20/20 accepted**. The second batch's 20 deliveries waited in the outbox
+(`outbox=20 pending=20`), the relay logged one `publish_failed … Message timed out`
+and backed off, and the consumer's partitions were revoked. After
+`docker compose start kafka`: partitions reassigned, outbox drained,
+`delivered=40 pending=0`.
+
 ## Reproducing
 
 Numbers vary by about ±20% between runs on a laptop (other processes, Docker VM

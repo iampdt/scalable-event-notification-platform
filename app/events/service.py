@@ -6,15 +6,16 @@ import json
 import uuid
 from dataclasses import asdict, dataclass
 
-from sqlalchemy import func, select
+from sqlalchemy import func, insert, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.errors import ApiError
 from app.api.schemas import IngestEvent
-from app.db.models import Delivery, DeliveryChannel, DeliveryStatus, Event, Notification, NotificationTemplate, User, WebhookEndpoint
+from app.db.models import Delivery, DeliveryChannel, DeliveryStatus, Event, Notification, NotificationTemplate, OutboxMessage, User, WebhookEndpoint
+from app.messaging import delivery_message
 from app.cache import get_cache
-from app.config import cache_ttl_seconds
+from app.config import cache_ttl_seconds, dispatch_mode
 from app.notifications.templates import TemplateError, render
 
 
@@ -147,6 +148,12 @@ def ingest(session: Session, tenant_id: uuid.UUID, idempotency_key: str, body: I
             session.flush()
             session.add_all(deliveries)
             session.flush()
+            if dispatch_mode() == "kafka":
+                # Same transaction as the deliveries: either both exist or neither.
+                # This is the transactional outbox -- no dual write to Kafka here.
+                messages = [delivery_message(d.id, tenant_id) for d in deliveries if d.status == DeliveryStatus.pending]
+                if messages:
+                    session.execute(insert(OutboxMessage), messages)
         assert created is not None
         return event_summary(created, len(notifications), len(deliveries))
     except IntegrityError:
