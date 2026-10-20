@@ -67,10 +67,15 @@ async def ingest(base_url: str, token: str, user_ids: list[str], channels: list[
         return latencies, statuses, time.perf_counter() - started
 
 
-def spawn_workers(count: int, batch_size: int) -> list[subprocess.Popen]:
-    env = {**os.environ, "EMAIL_PROVIDER": "fake"}
-    command = [sys.executable, "-m", "app.workers.delivery_worker", "--batch-size", str(batch_size), "--concurrency", str(batch_size), "--poll-seconds", "0.2"]
-    return [subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for _ in range(count)]
+def spawn_workers(count: int, batch_size: int, dispatch: str = "postgres") -> list[subprocess.Popen]:
+    env = {**os.environ, "EMAIL_PROVIDER": "fake", "DISPATCH_MODE": dispatch}
+    if dispatch == "kafka":
+        # One relay publishes the outbox; `count` consumers share the topic's partitions.
+        commands = [[sys.executable, "-m", "app.workers.outbox_relay"]]
+        commands += [[sys.executable, "-m", "app.workers.kafka_consumer", "--batch-size", str(batch_size), "--concurrency", str(batch_size)]] * count
+    else:
+        commands = [[sys.executable, "-m", "app.workers.delivery_worker", "--batch-size", str(batch_size), "--concurrency", str(batch_size), "--poll-seconds", "0.2"]] * count
+    return [subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for command in commands]
 
 
 def wait_for_drain(tenant_id: uuid.UUID, timeout: float) -> float:
@@ -94,12 +99,13 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--worker-batch", type=int, default=10)
     parser.add_argument("--start-workers-first", action="store_true", help="measure steady-state lag instead of backlog drain")
+    parser.add_argument("--dispatch", choices=["postgres", "kafka"], default="postgres", help="must match the API's DISPATCH_MODE")
     parser.add_argument("--rate-limit", type=float, help="give the tenant this events/s limit (burst = same) and report how the limiter behaves")
     args = parser.parse_args()
 
     tenant_id, token, user_ids = create_tenant(args.recipients, args.rate_limit)
     channels = args.channels.split(",")
-    workers = spawn_workers(args.workers, args.worker_batch) if args.start_workers_first else []
+    workers = spawn_workers(args.workers, args.worker_batch, args.dispatch) if args.start_workers_first else []
     try:
         latencies, statuses, elapsed = asyncio.run(ingest(args.base_url, token, user_ids, channels, args.events, args.concurrency))
         if args.rate_limit:
@@ -108,7 +114,7 @@ def main() -> None:
             return
         ingest_done = time.perf_counter()
         if not workers:
-            workers = spawn_workers(args.workers, args.worker_batch)
+            workers = spawn_workers(args.workers, args.worker_batch, args.dispatch)
         drain_seconds = wait_for_drain(tenant_id, timeout=600)
         total_seconds = time.perf_counter() - ingest_done + elapsed
     finally:

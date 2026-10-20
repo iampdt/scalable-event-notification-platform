@@ -14,6 +14,7 @@ import uuid
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.config import dispatch_mode
 from app.db.session import SessionLocal
 
 QUEUE_SQL = text(
@@ -61,6 +62,39 @@ def collect(session: Session, minutes: int = 60, tenant_id: uuid.UUID | None = N
     return {"queue": queue, "window_minutes": minutes, "by_channel": channels}
 
 
+OUTBOX_SQL = text(
+    """
+    SELECT count(*) AS depth,
+           count(*) FILTER (WHERE available_at <= now()) AS due,
+           count(*) FILTER (WHERE publish_attempts > 0) AS failing,
+           coalesce(extract(epoch FROM now() - min(available_at) FILTER (WHERE available_at <= now())), 0) AS oldest_due_seconds,
+           max(last_error) FILTER (WHERE publish_attempts > 0) AS sample_error
+    FROM outbox
+    """
+)
+
+
+def kafka_stats() -> dict | None:
+    """Consumer-group lag per partition: log-end offset minus committed offset."""
+    try:
+        from confluent_kafka import Consumer, TopicPartition
+
+        from app.messaging import consumer_config, delivery_topic
+
+        consumer = Consumer({**consumer_config(), "enable.auto.commit": False})
+        metadata = consumer.list_topics(delivery_topic(), timeout=3)
+        partitions = [TopicPartition(delivery_topic(), p) for p in metadata.topics[delivery_topic()].partitions]
+        committed = consumer.committed(partitions, timeout=5)
+        lag = {}
+        for tp in committed:
+            _, high = consumer.get_watermark_offsets(tp, timeout=3)
+            lag[tp.partition] = high - (tp.offset if tp.offset >= 0 else 0)
+        consumer.close()
+        return {"topic": delivery_topic(), "total_lag": sum(lag.values()), "lag_by_partition": {p: n for p, n in sorted(lag.items()) if n}}
+    except Exception as exc:  # stats must never crash on a missing broker
+        return {"error": str(exc)}
+
+
 def redis_stats() -> dict | None:
     """Server-wide numbers. Note keyspace hit rate mixes cache lookups with
     rate-limiter keys (which mostly miss by design), so it understates the cache."""
@@ -90,7 +124,11 @@ def main() -> None:
     args = parser.parse_args()
     with SessionLocal() as session:
         tenant_id = session.scalar(text("SELECT id FROM tenants WHERE slug = :slug"), {"slug": args.tenant_slug}) if args.tenant_slug else None
-        print(json.dumps({**collect(session, args.minutes, tenant_id), "redis": redis_stats()}, indent=2, default=float))
+        report = {**collect(session, args.minutes, tenant_id), "redis": redis_stats()}
+        if dispatch_mode() == "kafka":
+            report["outbox"] = dict(session.execute(OUTBOX_SQL).mappings().one())
+            report["kafka"] = kafka_stats()
+        print(json.dumps(report, indent=2, default=float))
 
 
 if __name__ == "__main__":
