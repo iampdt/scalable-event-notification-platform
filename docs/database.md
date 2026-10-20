@@ -325,6 +325,46 @@ transaction**, falling back to one commit per outcome if the batch fails.
 The provider-call gap is why delivery is at-least-once and requires stable
 provider keys.
 
+### Transactional outbox (Kafka mode)
+
+```sql
+CREATE TABLE outbox (
+  id BIGSERIAL PRIMARY KEY,
+  topic TEXT NOT NULL,
+  message_key TEXT NOT NULL,
+  payload JSONB NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
+  aggregate_id UUID NOT NULL,                       -- the delivery
+  available_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- future for retries
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  publish_attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT
+);
+CREATE INDEX idx_outbox_available ON outbox (available_at, id);
+CREATE INDEX idx_outbox_aggregate ON outbox (aggregate_id);
+```
+
+- **Written:** in the ingestion transaction (one row per pending delivery), in
+  the completion transaction for each retry (`available_at = next_attempt_at`),
+  and by the relay's sweeper for expired leases.
+- **Relay:** `SELECT … WHERE available_at <= now() ORDER BY available_at, id LIMIT n
+  FOR UPDATE SKIP LOCKED`, produce, wait for acks, then `DELETE` the acked ids and
+  commit. Failed rows get `publish_attempts + 1`, `last_error`, and
+  `available_at = now() + min(2^attempts, 300) s`.
+- It's a generic outbox (topic, key, payload), so other domain events can reuse it.
+- **Churn:** every row is inserted and deleted once, so it needs the same vacuum
+  attention as `deliveries`. A growing `publish_attempts` is an alert
+  (`python -m app.scripts.stats` reports failing rows).
+
+Consumer claim (fenced, so duplicate messages are no-ops):
+
+```sql
+UPDATE deliveries
+SET status = 'processing', attempt_count = attempt_count + 1,
+    lease_expires_at = now() + make_interval(secs => :lease_seconds), updated_at = now()
+WHERE id = ANY(:ids) AND status = 'pending' AND next_attempt_at <= now()
+RETURNING id;
+```
+
 ## State transitions
 
 | From | To | Condition |

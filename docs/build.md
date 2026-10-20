@@ -27,7 +27,7 @@ Load-test evidence: docs/benchmarks.md.
 - Real email provider: SMTP adapter (Mailpit locally, any SMTP relay in production)
 
 ### Not doing
-- Row-level security, retention policy, Kafka (until plan step 3),
+- Row-level security, retention policy,
   Kubernetes, subscriptions/preferences
 
 ## Milestones
@@ -125,8 +125,21 @@ tested.
 - [Done] Limiter accuracy under load (203 accepted vs 209 allowed); chaos check with Redis stopped mid-traffic
 - [Already done earlier] Cursor pagination, indexes justified by query plans
 
+### Plan alignment, step 3 (Kafka, asynchronous distributed processing)
+Done when: a request is queued through Kafka, processed by a consumer group,
+and tracked, with idempotent handling of duplicate messages, graceful shutdown,
+and a measured comparison against Postgres polling.
+- [Done] Transactional outbox (generic: topic, key, payload, aggregate_id, available_at)
+- [Done] Relay: SKIP LOCKED batches, acks before delete, per-row backoff (poison rows don't block), lease sweeper, `--backfill`
+- [Done] Topic design: `notification.deliveries.v1`, 12 partitions, key = `delivery_id`, 7-day retention, explicit creation; producer acks=all + idempotence
+- [Done] Consumer group: claim-check messages, fenced claim, two-phase fetch, commit after Postgres, seek back on failure, cooperative-sticky rebalancing, graceful leave
+- [Done] Retries scheduled through the outbox (`available_at`); `DISPATCH_MODE=postgres|kafka`
+- [Done] Measured against polling: equal latency when warm, no throughput gain (see benchmarks.md); three performance bugs found and fixed along the way
+- [Done] Kafka outage verified live: ingestion unaffected, outbox drained after recovery
+- [Corrected] The throughput justification for Kafka was wrong; the ceiling is Postgres state writes
+
 ## Current focus
-Next from the plan: step 3, Kafka via a transactional outbox (the Postgres queue measured about 1,600 deliveries/s against about 2,000/s for the worst-case fan-out).
+Next from the plan: step 4, reliability engineering (dead-letter flow with replay, provider circuit breaker, failure experiment report).
 Other candidate next steps, in priority order:
 1. Per-cache hit/miss metrics (Redis's server-wide hit rate mixes cache and limiter keys)
 2. Retention: time-partition `events`/`deliveries`/`delivery_attempts`
