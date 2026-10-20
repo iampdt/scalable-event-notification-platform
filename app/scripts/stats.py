@@ -62,6 +62,18 @@ def collect(session: Session, minutes: int = 60, tenant_id: uuid.UUID | None = N
     return {"queue": queue, "window_minutes": minutes, "by_channel": channels}
 
 
+DEAD_LETTERS_SQL = text(
+    """
+    SELECT channel::text AS channel, coalesce(last_error_code, 'unknown') AS error_code, count(*) AS failed
+    FROM deliveries
+    WHERE status = 'failed' AND failed_at >= now() - make_interval(mins => :minutes)
+      AND (CAST(:tenant_id AS uuid) IS NULL OR tenant_id = CAST(:tenant_id AS uuid))
+    GROUP BY 1, 2
+    ORDER BY failed DESC
+    LIMIT 20
+    """
+)
+
 OUTBOX_SQL = text(
     """
     SELECT count(*) AS depth,
@@ -125,6 +137,8 @@ def main() -> None:
     with SessionLocal() as session:
         tenant_id = session.scalar(text("SELECT id FROM tenants WHERE slug = :slug"), {"slug": args.tenant_slug}) if args.tenant_slug else None
         report = {**collect(session, args.minutes, tenant_id), "redis": redis_stats()}
+        # New dead letters by cause: the first thing to look at before a redrive.
+        report["dead_letters"] = [dict(row) for row in session.execute(DEAD_LETTERS_SQL, {"minutes": args.minutes, "tenant_id": str(tenant_id) if tenant_id else None}).mappings()]
         if dispatch_mode() == "kafka":
             report["outbox"] = dict(session.execute(OUTBOX_SQL).mappings().one())
             report["kafka"] = kafka_stats()
