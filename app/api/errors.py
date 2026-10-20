@@ -16,7 +16,8 @@ class ApiError(Exception):
 
 
 def error_body(code: str, message: str, request: Request, details: list[dict[str, Any]] | None = None) -> dict:
-    error: dict[str, Any] = {"code": code, "message": message, "request_id": request.headers.get("X-Request-Id", "")}
+    request_id = getattr(request.state, "request_id", None) or request.headers.get("X-Request-Id", "")
+    error: dict[str, Any] = {"code": code, "message": message, "request_id": request_id}
     if details:
         error["details"] = details
     return {"error": error}

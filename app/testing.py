@@ -66,3 +66,25 @@ def get_delivery(delivery_id: uuid.UUID) -> Delivery:
 def get_attempts(delivery_id: uuid.UUID) -> list[DeliveryAttempt]:
     with SessionLocal() as session:
         return list(session.scalars(select(DeliveryAttempt).where(DeliveryAttempt.delivery_id == delivery_id).order_by(DeliveryAttempt.attempt_number)))
+
+
+def create_api_key(tenant_id: uuid.UUID, role: ApiKeyRole, name: str) -> str:
+    token, prefix, secret_hash = generate_api_key()
+    with SessionLocal.begin() as session:
+        session.add(ApiKey(tenant_id=tenant_id, key_prefix=prefix, secret_hash=secret_hash, role=role, name=name))
+    return token
+
+
+def deliveries_for_event(tenant_id: uuid.UUID, event_id: str) -> list[Delivery]:
+    with SessionLocal() as session:
+        return list(session.scalars(
+            select(Delivery).join(Notification, Delivery.notification_id == Notification.id)
+            .where(Notification.tenant_id == tenant_id, Notification.event_id == uuid.UUID(event_id))
+            .order_by(Delivery.channel)
+        ))
+
+
+def make_due(delivery_id: uuid.UUID) -> None:
+    """Skip a retry backoff so the next claim picks the delivery up."""
+    with SessionLocal.begin() as session:
+        session.get(Delivery, delivery_id).next_attempt_at = datetime.now(timezone.utc) - timedelta(seconds=1)

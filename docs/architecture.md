@@ -1,4 +1,7 @@
-# Version 0 Architecture
+# Architecture
+
+Originally the V0 design; now describes the implemented V1.x system. Load-test
+evidence for the worker design is in [benchmarks.md](benchmarks.md).
 
 ## Purpose
 
@@ -104,10 +107,15 @@ stateDiagram-v2
 4. Only after commit does the API return `202 Accepted`. A matching retry returns
    the original event; a changed request using the key returns `409`.
 5. A worker atomically claims due rows with `FOR UPDATE SKIP LOCKED`, marks them
-   `processing`, and leases them.
-6. It renders and sends each channel payload outside the database transaction.
-7. A short completion transaction records an attempt and marks each delivery
-   delivered, pending with backoff, or failed.
+   `processing`, and leases them. It reclaims expired leases first, then takes due
+   rows. These are two index-ordered queries, not one `OR` query. Event,
+   user and webhook data are loaded in the same short transaction.
+6. It sends each channel payload outside the database transaction, on a thread
+   pool (batch 10, concurrency 10 by default). Adapters have no database access.
+7. One short completion transaction per batch records an attempt for each delivery
+   and marks it delivered, pending with backoff, or failed. Every row
+   update is fenced on `attempt_count`, so a worker whose lease was taken over
+   cannot overwrite the newer attempt.
 
 ## Reliability decisions
 
@@ -119,11 +127,21 @@ as a provider idempotency key when supported and as
 
 - Producer idempotency is tenant-scoped and compares a request hash.
 - Retryable errors use bounded exponential backoff with jitter: 30 seconds, 2
-  minutes, 10 minutes, and hourly retries, capped at five attempts.
-- Known permanent errors (bad email, most webhook 4xx responses) are final;
-  `408` and `429` remain retryable.
-- Expired processing leases can be reclaimed after a worker crash.
-- Provider diagnostics are truncated and scrubbed before persistence.
+  minutes, 10 minutes, and hourly retries, capped at five attempts. A provider's
+  `Retry-After` is honoured when it asks for longer (still capped at 1 h).
+- Known permanent errors (bad email, most webhook 4xx responses, any 3xx since
+  redirects are not followed) are final; `408` and `429` remain retryable. SMTP
+  authentication failures (`530/534/535`) are retryable because they are an
+  operator problem, not a bad recipient.
+- Expired processing leases can be reclaimed after a worker crash, up to
+  `max_attempts`; past that the delivery is failed as `worker_lost`, so a poison
+  message cannot crash workers forever. The worker
+  refuses to start if `lease < 2 × ceil(batch / concurrency) × provider timeout`,
+  because a lease that expires mid-send causes a duplicate.
+- `SIGTERM` finishes the in-flight batch and exits; `SIGKILL` is covered by leases.
+- Provider diagnostics are truncated and scrubbed before persistence: only status
+  codes and short messages, never receiver response bodies or exception traces.
+- Lease and schedule times use the database clock, never worker clocks.
 
 ## Tenant boundary and modules
 
@@ -131,15 +149,20 @@ The API never takes `tenant_id` from JSON. It gets it from the credential. UUIDs
 are identifiers, not authorization: every repository query filters by tenant.
 V0.1 enforces this in application code and tests; PostgreSQL row-level security
 is a later defense-in-depth requirement before a non-development deployment.
+Composite foreign keys (`(tenant_id, parent_id)`) already make cross-tenant links
+impossible at the schema level, and cross-tenant lookups return `404` rather than
+`403`. Credentials carry a role: `producer` (ingest + read) or `admin`
+(also configures users and webhook endpoints).
 
-| Module | Owns |
-| --- | --- |
-| `api` | HTTP validation, authentication, response mapping |
-| `events` | Event persistence and fan-out orchestration |
-| `notifications` | Delivery state transitions and retry policy |
-| `workers` | Claiming work and running retry orchestration |
-| `providers` | Email/webhook/in-app adapter contracts |
-| `persistence` | Transactions, models, and repository implementation |
+| Module | Owns | Code |
+| --- | --- | --- |
+| `api` | HTTP validation, authentication, response mapping | `app/api/` |
+| `events` | Event persistence and fan-out orchestration | `app/events/service.py` |
+| `notifications` | Retry policy, failure classification, derived status | `app/notifications/` |
+| `workers` | Claiming work, concurrency, completion | `app/workers/delivery_worker.py` |
+| `providers` | Email (SMTP, fake), webhook (HMAC, SSRF guard), in-app adapters | `app/providers/` |
+| `persistence` | Engine/session, models (migrations own the DDL) | `app/db/`, `alembic/versions/` |
+| `scripts` | Seed, queue stats, reference webhook receiver | `app/scripts/` |
 
 ## Earned-complexity roadmap
 
@@ -155,20 +178,27 @@ write event plus outbox row in one transaction, then publish the outbox.
 
 ## Validation plan
 
-- Unit-test validation, fan-out, idempotency comparison, transition rules, and
-  retry classification.
-- Integration-test rollback on invalid recipient, duplicate ingestion without extra
-  deliveries, and cross-tenant access denial.
-- Simulate provider success, timeout, `429`, `5xx`, and permanent `4xx` with a
-  fake adapter.
-- Simulate a worker crash by expiring a processing lease and assert it is reclaimed
-  as another attempt, not a newly created delivery.
-- Establish a baseline over 1,000 events: p50/p95 ingestion time, queue depth,
-  p50/p95 delivery lag, retry rate, and terminal failure rate.
+All items below are implemented (61 tests; CI runs them against PostgreSQL 16).
+
+- [x] Unit-test validation, fan-out, idempotency comparison, transition rules, and
+  retry classification. (`tests/test_providers.py`, no database needed)
+- [x] Integration-test rollback on invalid recipient, duplicate ingestion without extra
+  deliveries, and cross-tenant access denial. Includes a forced-interleaving
+  test of the concurrent same-key race.
+- [x] Simulate provider success, timeout, `429`, `5xx`, and permanent `4xx` with
+  `httpx.MockTransport`, and end to end against a real signed-webhook receiver.
+- [x] Simulate a worker crash by expiring a processing lease and assert it is reclaimed
+  as another attempt, not a newly created delivery. Plus fencing of the stale
+  worker's late completion.
+- [x] Establish a baseline over 1,000 events: p50/p95 ingestion time, queue depth,
+  p50/p95 delivery lag, retry rate, and terminal failure rate. See
+  [benchmarks.md](benchmarks.md): ingest p95 131–233 ms; 4 workers about 1,600–1,700
+  deliveries/s; steady-state lag p95 0.52 s.
 
 ## Open decisions
 
-1. Allow arbitrary email recipients or only tenant-managed users?
+1. Allow arbitrary email recipients or only tenant-managed users? (Currently: only
+   tenant-managed users.)
 2. Which event types need formal JSON schemas beyond generic JSONB payloads?
 3. What retention, redaction, deletion, and compliance policy applies to payloads?
 4. Which production email provider and credential model should be used?

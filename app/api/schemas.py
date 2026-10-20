@@ -1,4 +1,4 @@
-"""Strict request schemas for producer ingestion."""
+"""Strict request schemas; unknown fields are rejected so client typos fail loudly."""
 from __future__ import annotations
 
 import json
@@ -22,7 +22,7 @@ class Subject(StrictModel):
 
 class Recipient(StrictModel):
     user_id: uuid.UUID
-    channels: list[Literal["email", "in_app"]]
+    channels: list[Literal["email", "webhook", "in_app"]]
 
     @field_validator("channels")
     @classmethod
@@ -68,3 +68,22 @@ class IngestEvent(StrictModel):
         if len(ids) != len(set(ids)):
             raise ValueError("recipients must have distinct user_id values")
         return self
+
+
+class UpsertUser(StrictModel):
+    external_id: Annotated[str, Field(min_length=1, max_length=200)]
+    email: Annotated[str | None, Field(max_length=320, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")] = None
+    active: bool = True
+
+
+class CreateWebhookEndpoint(StrictModel):
+    url: Annotated[str, Field(min_length=1, max_length=2048)]
+    # Omit to have the platform generate a strong secret (returned once).
+    secret: Annotated[str | None, Field(min_length=24, max_length=256)] = None
+    active: bool = True
+    is_default: bool = True
+
+
+class UpdateWebhookEndpoint(StrictModel):
+    active: bool | None = None
+    is_default: bool | None = None
