@@ -28,11 +28,12 @@ import time
 
 from confluent_kafka import KafkaException, Producer
 from sqlalchemy import insert, text
+from sqlalchemy.exc import OperationalError
 
 from app.db.models import OutboxMessage
 from app.db.session import SessionLocal
 from app.messaging import delivery_message, producer_config
-from app.workers.delivery_worker import FAIL_ABANDONED_SQL, GracefulExit
+from app.workers.delivery_worker import FAIL_ABANDONED_SQL, Backoff, GracefulExit
 
 logger = logging.getLogger(__name__)
 
@@ -162,13 +163,19 @@ def main() -> None:
     stop = GracefulExit()
     next_sweep = 0.0
     logger.info("relay_started batch_size=%s", args.batch_size)
+    backoff = Backoff()
     while not stop.requested:
-        published, failed = relay.publish_batch()
+        try:
+            published, failed = relay.publish_batch()
+            if time.monotonic() >= next_sweep:
+                relay.sweep()
+                next_sweep = time.monotonic() + args.sweep_seconds
+        except OperationalError as exc:
+            backoff.failed("database", exc)
+            continue
+        backoff.succeeded()
         if failed and not published:
             time.sleep(1)  # likely the broker is down: don't spin
-        if time.monotonic() >= next_sweep:
-            relay.sweep()
-            next_sweep = time.monotonic() + args.sweep_seconds
         if not published:
             time.sleep(args.poll_seconds)
     relay.producer.flush(10)

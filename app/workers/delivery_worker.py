@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, insert, text, update
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from app.config import dispatch_mode, email_provider_name, webhook_timeout_seconds
 from app.db.models import Delivery, DeliveryAttempt, DeliveryChannel, DeliveryStatus, OutboxMessage
@@ -315,6 +315,29 @@ class DeliveryWorker:
         return len(claimed)
 
 
+class Backoff:
+    """In-process exponential backoff for a dependency outage (1 s doubling to 30 s).
+
+    Without it, a worker loop that hits a database error crashes and relies on
+    the container restart policy: noisy restarts, lost graceful shutdown, and
+    every restart re-pays connection and consumer-group setup.
+    """
+
+    def __init__(self, base: float = 1.0, cap: float = 30.0):
+        self.base, self.cap, self.failures = base, cap, 0
+
+    def failed(self, what: str, exc: Exception) -> None:
+        delay = min(self.cap, self.base * 2 ** self.failures)
+        self.failures += 1
+        logger.error("%s_unavailable error=%s; retrying in %.0fs (failure %s)", what, type(exc).__name__, delay, self.failures)
+        time.sleep(delay)
+
+    def succeeded(self) -> None:
+        if self.failures:
+            logger.info("dependency_recovered after %s failures", self.failures)
+        self.failures = 0
+
+
 class GracefulExit:
     """SIGTERM/SIGINT finish the in-flight batch; anything cut short is covered by lease reclaim."""
 
@@ -343,8 +366,14 @@ def main() -> None:
     stop = GracefulExit()
     logger.info("worker_started batch_size=%s concurrency=%s lease_seconds=%s", args.batch_size, args.concurrency, args.lease_seconds)
     with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+        backoff = Backoff()
         while not stop.requested:
-            processed = worker.run_once(args.batch_size, executor)
+            try:
+                processed = worker.run_once(args.batch_size, executor)
+            except OperationalError as exc:
+                backoff.failed("database", exc)
+                continue
+            backoff.succeeded()
             if args.once:
                 return
             if not processed:
