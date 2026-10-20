@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, OperationalError
 
-from app.api import admin, feed
+from app.api import admin, dead_letters, feed
 from app.api.errors import ApiError, api_error_handler, error_body
 from app.api.routes import router
 
@@ -96,6 +96,7 @@ def create_app() -> FastAPI:
     app.include_router(router)
     app.include_router(feed.router)
     app.include_router(admin.router)
+    app.include_router(dead_letters.router)
     return app
 
 
