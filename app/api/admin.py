@@ -17,8 +17,8 @@ from sqlalchemy.orm import Session
 from app.api.auth import admin_key
 from app.api.errors import ApiError
 from app.api.pagination import apply_cursor, page
-from app.api.schemas import CreateWebhookEndpoint, UpdateWebhookEndpoint, UpsertUser
-from app.db.models import ApiKey, User, WebhookEndpoint
+from app.api.schemas import CreateWebhookEndpoint, UpdateWebhookEndpoint, UpsertTemplate, UpsertUser
+from app.db.models import ApiKey, DeliveryChannel, NotificationTemplate, User, WebhookEndpoint
 from app.db.session import get_session
 from app.providers.webhook import UnsafeWebhookUrl, validate_webhook_url
 from app.security import encrypt_secret, generate_webhook_secret
@@ -113,3 +113,53 @@ def update_webhook_endpoint(endpoint_id: uuid.UUID, body: UpdateWebhookEndpoint,
     except IntegrityError as exc:
         raise ApiError(409, "conflict", "Another default webhook endpoint was set concurrently; retry.") from exc
     return endpoint_body(endpoint)
+
+
+def template_body(template: NotificationTemplate) -> dict:
+    return {"id": str(template.id), "event_type": template.event_type, "channel": template.channel.value, "subject": template.subject, "body": template.body, "version": template.version, "active": template.active, "created_at": template.created_at.isoformat(), "updated_at": template.updated_at.isoformat()}
+
+
+@router.post("/templates")
+def upsert_template(body: UpsertTemplate, response: Response, key: ApiKey = Depends(admin_key), session: Session = Depends(get_session)) -> dict:
+    """Idempotent by (tenant, event_type, channel). Editing bumps the version;
+    deliveries already planned keep the content rendered from the old version."""
+    try:
+        with session.begin():
+            template = session.scalar(
+                select(NotificationTemplate)
+                .where(NotificationTemplate.tenant_id == key.tenant_id, NotificationTemplate.event_type == body.event_type, NotificationTemplate.channel == DeliveryChannel(body.channel))
+                .with_for_update()
+            )
+            if template:
+                changed = (template.subject, template.body, template.active) != (body.subject, body.body, body.active)
+                template.subject, template.body, template.active = body.subject, body.body, body.active
+                if changed:
+                    template.version += 1
+                response.status_code = 200
+            else:
+                template = NotificationTemplate(tenant_id=key.tenant_id, event_type=body.event_type, channel=DeliveryChannel(body.channel), subject=body.subject, body=body.body, active=body.active)
+                session.add(template)
+                response.status_code = 201
+            session.flush()
+            session.refresh(template)
+            return template_body(template)
+    except IntegrityError as exc:
+        raise ApiError(409, "conflict", "Template was created concurrently; retry.") from exc
+
+
+@router.get("/templates")
+def list_templates(event_type: str | None = None, limit: Annotated[int, Query(ge=1, le=100)] = 50, cursor: str | None = None, key: ApiKey = Depends(admin_key), session: Session = Depends(get_session)) -> dict:
+    query = select(NotificationTemplate).where(NotificationTemplate.tenant_id == key.tenant_id)
+    if event_type:
+        query = query.where(NotificationTemplate.event_type == event_type)
+    query = apply_cursor(query, NotificationTemplate.created_at, NotificationTemplate.id, cursor).limit(limit + 1)
+    rows, next_cursor = page(session.scalars(query).all(), limit, lambda row: row.created_at, lambda row: row.id)
+    return {"data": [template_body(row) for row in rows], "next_cursor": next_cursor}
+
+
+@router.get("/templates/{template_id}")
+def get_template(template_id: uuid.UUID, key: ApiKey = Depends(admin_key), session: Session = Depends(get_session)) -> dict:
+    template = session.scalar(select(NotificationTemplate).where(NotificationTemplate.tenant_id == key.tenant_id, NotificationTemplate.id == template_id))
+    if not template:
+        raise ApiError(404, "not_found", "Resource was not found.")
+    return template_body(template)

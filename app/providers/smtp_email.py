@@ -23,10 +23,15 @@ def build_message(delivery: ClaimedDelivery, sender: str) -> EmailMessage:
     message = EmailMessage()
     message["From"] = sender
     message["To"] = delivery.target_snapshot["email"]
-    message["Subject"] = f"Notification: {delivery.event_type}"
+    content = delivery.content or {}
+    message["Subject"] = content.get("subject") or f"Notification: {delivery.event_type}"
     # A stable Message-ID lets downstream systems spot an at-least-once duplicate.
     message["Message-ID"] = f"<{delivery.id}@notifications.local>"
     message["X-Notification-Delivery-Id"] = str(delivery.id)
+    if content.get("body"):
+        message.set_content(content["body"])
+        return message
+    # No template for this event type: fall back to a generic dump of the payload.
     message.set_content(
         f"Event: {delivery.event_type}\n"
         f"Subject: {(delivery.subject or {}).get('type')} {(delivery.subject or {}).get('id')}\n\n"

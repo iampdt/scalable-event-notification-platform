@@ -11,7 +11,8 @@ from sqlalchemy.orm import Session
 
 from app.api.errors import ApiError
 from app.api.schemas import IngestEvent
-from app.db.models import Delivery, DeliveryChannel, DeliveryStatus, Event, Notification, User, WebhookEndpoint
+from app.db.models import Delivery, DeliveryChannel, DeliveryStatus, Event, Notification, NotificationTemplate, User, WebhookEndpoint
+from app.notifications.templates import TemplateError, render
 
 
 def normalized_hash(body: IngestEvent) -> str:
@@ -47,6 +48,26 @@ def plan_delivery(channel: str, user: User, endpoint: WebhookEndpoint | None) ->
     return {"user_id": str(user.id)}, DeliveryStatus.pending, None
 
 
+def render_content(template: NotificationTemplate, body: IngestEvent, user: User) -> dict:
+    context = {
+        "event_type": body.event_type,
+        "subject": {"type": body.subject.type, "id": body.subject.id},
+        "payload": body.payload,
+        "recipient": {"external_id": user.external_id, "email": user.email},
+    }
+    try:
+        return {
+            "subject": render(template.subject, context) if template.subject else None,
+            "body": render(template.body, context),
+            "template_id": str(template.id),
+            "template_version": template.version,
+        }
+    except TemplateError as exc:
+        # Rendering at ingestion means the producer hears about a missing field
+        # now, as a 422, instead of a delivery failing silently later.
+        raise ApiError(422, "unprocessable", "Event payload does not satisfy the notification template.", [{"field": f"template[{template.event_type}/{template.channel.value}]", "issue": str(exc)}]) from exc
+
+
 def ingest(session: Session, tenant_id: uuid.UUID, idempotency_key: str, body: IngestEvent) -> dict:
     request_hash = normalized_hash(body)
     created: Event | None = None
@@ -69,6 +90,19 @@ def ingest(session: Session, tenant_id: uuid.UUID, idempotency_key: str, body: I
             if any("webhook" in recipient.channels for recipient in body.recipients):
                 endpoint = session.scalar(select(WebhookEndpoint).where(WebhookEndpoint.tenant_id == tenant_id, WebhookEndpoint.active.is_(True), WebhookEndpoint.is_default.is_(True)))
 
+            requested_channels = {channel for recipient in body.recipients for channel in recipient.channels}
+            templates = {
+                template.channel.value: template
+                for template in session.scalars(
+                    select(NotificationTemplate).where(
+                        NotificationTemplate.tenant_id == tenant_id,
+                        NotificationTemplate.event_type == body.event_type,
+                        NotificationTemplate.active.is_(True),
+                        NotificationTemplate.channel.in_([DeliveryChannel(c) for c in requested_channels]),
+                    )
+                )
+            }
+
             created = Event(tenant_id=tenant_id, idempotency_key=idempotency_key, request_hash=request_hash, event_type=body.event_type, subject_type=body.subject.type, subject_id=body.subject.id, payload=body.payload, metadata_=body.metadata)
             session.add(created)
             session.flush()
@@ -81,7 +115,9 @@ def ingest(session: Session, tenant_id: uuid.UUID, idempotency_key: str, body: I
                 notifications.append(notification)
                 for channel in recipient.channels:
                     target, status, endpoint_id = plan_delivery(channel, user, endpoint)
-                    deliveries.append(Delivery(tenant_id=tenant_id, notification_id=notification.id, channel=DeliveryChannel(channel), status=status, target_snapshot=target, webhook_endpoint_id=endpoint_id))
+                    template = templates.get(channel)
+                    content = render_content(template, body, user) if template and status == DeliveryStatus.pending else None
+                    deliveries.append(Delivery(tenant_id=tenant_id, notification_id=notification.id, channel=DeliveryChannel(channel), status=status, target_snapshot=target, webhook_endpoint_id=endpoint_id, content=content))
             session.add_all(notifications)
             session.flush()
             session.add_all(deliveries)

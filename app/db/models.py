@@ -86,6 +86,27 @@ class WebhookEndpoint(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class NotificationTemplate(Base):
+    __tablename__ = "notification_templates"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "event_type", "channel"),
+        UniqueConstraint("tenant_id", "id"),
+        CheckConstraint("channel IN ('email', 'in_app')", name="notification_templates_channel_supported"),
+        CheckConstraint("channel <> 'email' OR subject IS NOT NULL", name="notification_templates_email_has_subject"),
+        CheckConstraint("version > 0", name="notification_templates_version_positive"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
+    event_type: Mapped[str] = mapped_column(Text)
+    channel: Mapped[DeliveryChannel] = mapped_column(Enum(DeliveryChannel, name="delivery_channel"), nullable=False)
+    subject: Mapped[str | None] = mapped_column(Text)
+    body: Mapped[str] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, server_default=text("1"))
+    active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class Event(Base):
     __tablename__ = "events"
     __table_args__ = (UniqueConstraint("tenant_id", "idempotency_key"), UniqueConstraint("tenant_id", "id"))
@@ -113,7 +134,7 @@ class Notification(Base):
 
 class Delivery(Base):
     __tablename__ = "deliveries"
-    __table_args__ = (UniqueConstraint("tenant_id", "id"), UniqueConstraint("notification_id", "channel"), ForeignKeyConstraint(["tenant_id", "notification_id"], ["notifications.tenant_id", "notifications.id"]), CheckConstraint("attempt_count >= 0"), CheckConstraint("max_attempts > 0"), CheckConstraint("jsonb_typeof(target_snapshot) = 'object'"), CheckConstraint("(status <> 'delivered') OR delivered_at IS NOT NULL"), CheckConstraint("(status <> 'failed') OR failed_at IS NOT NULL"), ForeignKeyConstraint(["tenant_id", "webhook_endpoint_id"], ["webhook_endpoints.tenant_id", "webhook_endpoints.id"]), CheckConstraint("channel = 'webhook' OR webhook_endpoint_id IS NULL"), CheckConstraint("channel <> 'webhook' OR webhook_endpoint_id IS NOT NULL OR status = 'suppressed'"))
+    __table_args__ = (UniqueConstraint("tenant_id", "id"), UniqueConstraint("notification_id", "channel"), ForeignKeyConstraint(["tenant_id", "notification_id"], ["notifications.tenant_id", "notifications.id"]), CheckConstraint("attempt_count >= 0"), CheckConstraint("max_attempts > 0"), CheckConstraint("jsonb_typeof(target_snapshot) = 'object'"), CheckConstraint("(status <> 'delivered') OR delivered_at IS NOT NULL"), CheckConstraint("(status <> 'failed') OR failed_at IS NOT NULL"), ForeignKeyConstraint(["tenant_id", "webhook_endpoint_id"], ["webhook_endpoints.tenant_id", "webhook_endpoints.id"]), CheckConstraint("channel = 'webhook' OR webhook_endpoint_id IS NULL"), CheckConstraint("channel <> 'webhook' OR webhook_endpoint_id IS NOT NULL OR status = 'suppressed'"), CheckConstraint("content IS NULL OR jsonb_typeof(content) = 'object'", name="deliveries_content_is_object"))
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     notification_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
@@ -121,6 +142,8 @@ class Delivery(Base):
     status: Mapped[DeliveryStatus] = mapped_column(Enum(DeliveryStatus, name="delivery_status"), server_default=text("'pending'"))
     target_snapshot: Mapped[dict] = mapped_column(JSONB)
     webhook_endpoint_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    # none_as_null: without it SQLAlchemy stores Python None as the JSON value 'null', not SQL NULL.
+    content: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
     attempt_count: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     max_attempts: Mapped[int] = mapped_column(Integer, server_default=text("5"))
     next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -78,7 +78,7 @@ CLAIM_DUE_SQL = text(CLAIM_TEMPLATE.format(status="pending", due_column="next_at
 # Everything an adapter needs, loaded in the claim transaction so adapters stay DB-free.
 JOB_SQL = text(
     """
-    SELECT d.id, d.tenant_id, d.channel, d.target_snapshot, d.attempt_count, d.max_attempts,
+    SELECT d.id, d.tenant_id, d.channel, d.target_snapshot, d.content, d.attempt_count, d.max_attempts,
            n.id AS notification_id, u.id AS user_id, u.external_id,
            e.id AS event_id, e.event_type, e.subject_type, e.subject_id, e.payload, e.created_at AS occurred_at,
            w.active AS webhook_active, w.secret_ciphertext
@@ -161,6 +161,7 @@ class DeliveryWorker:
                     tenant_id=row.tenant_id,
                     channel=DeliveryChannel(row.channel),
                     target_snapshot=row.target_snapshot,
+                    content=row.content,
                     attempt_count=row.attempt_count,
                     max_attempts=row.max_attempts,
                     notification_id=row.notification_id,

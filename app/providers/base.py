@@ -31,6 +31,8 @@ class ClaimedDelivery:
     payload: dict | None = None
     occurred_at: datetime | None = None
     webhook_active: bool | None = None
+    # Rendered template ({subject, body, template_id, template_version}) or None.
+    content: dict | None = None
     # repr=False keeps the (encrypted) secret out of logs and tracebacks.
     webhook_secret_ciphertext: bytes | None = field(default=None, repr=False)
 

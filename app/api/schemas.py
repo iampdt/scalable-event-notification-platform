@@ -87,3 +87,32 @@ class CreateWebhookEndpoint(StrictModel):
 class UpdateWebhookEndpoint(StrictModel):
     active: bool | None = None
     is_default: bool | None = None
+
+
+class UpsertTemplate(StrictModel):
+    event_type: Annotated[str, Field(min_length=1, max_length=100)]
+    channel: Literal["email", "in_app"]
+    # Email subject, or in-app title.
+    subject: Annotated[str | None, Field(min_length=1, max_length=200)] = None
+    body: Annotated[str, Field(min_length=1, max_length=16 * 1024)]
+    active: bool = True
+
+    @field_validator("event_type")
+    @classmethod
+    def valid_event_type(cls, value: str) -> str:
+        if not EVENT_TYPE.fullmatch(value):
+            raise ValueError("must be an identifier containing only letters, numbers, dot, underscore, or dash")
+        return value
+
+    @model_validator(mode="after")
+    def valid_template(self) -> "UpsertTemplate":
+        from app.notifications.templates import TemplateError, placeholders
+
+        if self.channel == "email" and not self.subject:
+            raise ValueError("email templates require a subject")
+        try:
+            placeholders(self.subject or "")
+            placeholders(self.body)
+        except TemplateError as exc:
+            raise ValueError(str(exc)) from exc
+        return self
