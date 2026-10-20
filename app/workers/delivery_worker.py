@@ -1,111 +1,312 @@
-"""PostgreSQL SKIP LOCKED worker for at-least-once delivery."""
+"""PostgreSQL SKIP LOCKED worker for at-least-once delivery.
+
+One cycle: claim (short txn) -> send concurrently (no txn) -> complete (one short txn per batch).
+Never hold a database transaction open across provider I/O.
+"""
 from __future__ import annotations
 
 import argparse
+import logging
+import math
+import signal
 import time
-import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, insert, text, update
+from sqlalchemy.exc import SQLAlchemyError
 
+from app.config import email_provider_name, webhook_timeout_seconds
 from app.db.models import Delivery, DeliveryAttempt, DeliveryChannel, DeliveryStatus
 from app.db.session import SessionLocal
 from app.notifications.retry import ProviderFailure, retry_delay_seconds
+from app.providers.base import ClaimedDelivery, Provider
 from app.providers.fake_email import FakeEmailProvider
+from app.providers.in_app import InAppProvider
+from app.providers.smtp_email import SmtpEmailProvider
+from app.providers.webhook import WebhookProvider
+
+logger = logging.getLogger(__name__)
+
+# Claiming is split into two statements, one per partial index. A single query
+# with "pending-and-due OR processing-and-expired" made PostgreSQL BitmapOr both
+# indexes, fetch and sort *every* due row, then keep :limit of them, so each
+# claim cost O(backlog). Each statement below is an ordered index scan that stops
+# after :limit unlocked rows. Leases use the *database* clock so workers on different hosts
+# cannot disagree about whether a lease has expired.
+CLAIM_TEMPLATE = """
+    WITH picked AS (
+        SELECT id FROM deliveries
+        WHERE status = '{status}' AND {due_column} {comparison} now(){extra}
+        ORDER BY {due_column}, id
+        LIMIT :limit
+        FOR UPDATE SKIP LOCKED
+    )
+    UPDATE deliveries d
+    SET status = 'processing',
+        attempt_count = d.attempt_count + 1,
+        lease_expires_at = now() + make_interval(secs => :lease_seconds),
+        updated_at = now()
+    FROM picked
+    WHERE d.id = picked.id
+    RETURNING d.id
+"""
+RECLAIM_EXPIRED_SQL = text(CLAIM_TEMPLATE.format(status="processing", due_column="lease_expires_at", comparison="<", extra=" AND attempt_count < max_attempts"))
+
+# Poison-message guard: a delivery whose attempts keep killing the worker (OOM,
+# segfault, hang) never reaches the normal "attempts exhausted" check, because no
+# failure is ever recorded. Without this it would be reclaimed forever.
+FAIL_ABANDONED_SQL = text(
+    """
+    WITH abandoned AS (
+        SELECT id FROM deliveries
+        WHERE status = 'processing' AND lease_expires_at < now() AND attempt_count >= max_attempts
+        LIMIT :limit
+        FOR UPDATE SKIP LOCKED
+    )
+    UPDATE deliveries d
+    SET status = 'failed', failed_at = now(), lease_expires_at = NULL,
+        last_error_code = 'worker_lost', updated_at = now()
+    FROM abandoned
+    WHERE d.id = abandoned.id
+    RETURNING d.id
+    """
+)
+CLAIM_DUE_SQL = text(CLAIM_TEMPLATE.format(status="pending", due_column="next_attempt_at", comparison="<=", extra=""))
+
+# Everything an adapter needs, loaded in the claim transaction so adapters stay DB-free.
+JOB_SQL = text(
+    """
+    SELECT d.id, d.tenant_id, d.channel, d.target_snapshot, d.attempt_count, d.max_attempts,
+           n.id AS notification_id, u.id AS user_id, u.external_id,
+           e.id AS event_id, e.event_type, e.subject_type, e.subject_id, e.payload, e.created_at AS occurred_at,
+           w.active AS webhook_active, w.secret_ciphertext
+    FROM deliveries d
+    JOIN notifications n ON n.tenant_id = d.tenant_id AND n.id = d.notification_id
+    JOIN users u ON u.tenant_id = n.tenant_id AND u.id = n.user_id
+    JOIN events e ON e.tenant_id = n.tenant_id AND e.id = n.event_id
+    LEFT JOIN webhook_endpoints w ON w.tenant_id = d.tenant_id AND w.id = d.webhook_endpoint_id
+    WHERE d.id = ANY(:ids)
+    ORDER BY d.next_attempt_at, d.id
+    """
+)
+
+
+def default_email_provider() -> Provider:
+    return SmtpEmailProvider() if email_provider_name() == "smtp" else FakeEmailProvider()
 
 
 @dataclass(frozen=True)
-class ClaimedDelivery:
-    id: uuid.UUID
-    tenant_id: uuid.UUID
-    channel: DeliveryChannel
-    target_snapshot: dict
-    attempt_count: int
-    max_attempts: int
+class Outcome:
+    claimed: ClaimedDelivery
+    started_at: datetime
+    completed_at: datetime
+    status_code: int | None = None
+    failure: ProviderFailure | None = None
 
 
 class DeliveryWorker:
-    def __init__(self, email_provider: FakeEmailProvider | None = None, lease_seconds: int = 60):
-        self.email_provider = email_provider or FakeEmailProvider()
+    def __init__(
+        self,
+        email_provider: Provider | None = None,
+        webhook_provider: Provider | None = None,
+        lease_seconds: int = 60,
+        concurrency: int = 10,
+        provider_timeout_seconds: float | None = None,
+    ):
+        self.providers: dict[DeliveryChannel, Provider] = {
+            DeliveryChannel.email: email_provider or default_email_provider(),
+            DeliveryChannel.webhook: webhook_provider or WebhookProvider(),
+            DeliveryChannel.in_app: InAppProvider(),
+        }
         self.lease_seconds = lease_seconds
+        self.concurrency = concurrency
+        self.provider_timeout_seconds = provider_timeout_seconds if provider_timeout_seconds is not None else webhook_timeout_seconds()
+        self.reclaimed_total = 0
 
-    def claim(self, batch_size: int = 25) -> list[ClaimedDelivery]:
-        now = datetime.now(timezone.utc)
-        with SessionLocal.begin() as session:
-            due = session.scalars(
-                select(Delivery)
-                .where(or_((Delivery.status == DeliveryStatus.pending) & (Delivery.next_attempt_at <= now), (Delivery.status == DeliveryStatus.processing) & (Delivery.lease_expires_at < now)))
-                .order_by(Delivery.next_attempt_at, Delivery.id)
-                .limit(batch_size)
-                .with_for_update(skip_locked=True)
-            ).all()
-            for delivery in due:
-                delivery.status = DeliveryStatus.processing
-                delivery.attempt_count += 1
-                delivery.lease_expires_at = now + timedelta(seconds=self.lease_seconds)
-                delivery.updated_at = now
-            session.flush()
-            return [ClaimedDelivery(item.id, item.tenant_id, item.channel, item.target_snapshot, item.attempt_count, item.max_attempts) for item in due]
+    def check_lease_budget(self, batch_size: int) -> None:
+        """A lease that expires while we are still sending causes a duplicate send.
 
-    def complete_success(self, claimed: ClaimedDelivery) -> bool:
-        with SessionLocal.begin() as session:
-            delivery = session.scalar(select(Delivery).where(Delivery.id == claimed.id, Delivery.status == DeliveryStatus.processing, Delivery.attempt_count == claimed.attempt_count).with_for_update())
-            if not delivery:
-                return False
-            now = datetime.now(timezone.utc)
-            delivery.status = DeliveryStatus.delivered
-            delivery.delivered_at = now
-            delivery.lease_expires_at = None
-            delivery.last_error_code = None
-            session.add(DeliveryAttempt(tenant_id=delivery.tenant_id, delivery_id=delivery.id, attempt_number=claimed.attempt_count, started_at=now, completed_at=now, outcome="success"))
-            return True
+        Worst case a batch takes ceil(batch/concurrency) sequential provider
+        timeouts; require the lease to cover twice that.
+        """
+        worst_case = math.ceil(batch_size / self.concurrency) * self.provider_timeout_seconds
+        if self.lease_seconds < 2 * worst_case:
+            raise ValueError(
+                f"lease_seconds={self.lease_seconds} is too short for batch_size={batch_size}, "
+                f"concurrency={self.concurrency}, provider timeout={self.provider_timeout_seconds}s "
+                f"(needs >= {2 * worst_case:.0f}s)"
+            )
 
-    def complete_failure(self, claimed: ClaimedDelivery, failure: ProviderFailure) -> bool:
+    def claim(self, batch_size: int = 10) -> list[ClaimedDelivery]:
         with SessionLocal.begin() as session:
-            delivery = session.scalar(select(Delivery).where(Delivery.id == claimed.id, Delivery.status == DeliveryStatus.processing, Delivery.attempt_count == claimed.attempt_count).with_for_update())
-            if not delivery:
-                return False
-            now = datetime.now(timezone.utc)
+            params = {"limit": batch_size, "lease_seconds": self.lease_seconds}
+            abandoned = session.execute(FAIL_ABANDONED_SQL, params).all()
+            if abandoned:
+                logger.error("abandoned_deliveries_failed count=%s ids=%s", len(abandoned), [str(row.id) for row in abandoned])
+            # Crashed workers' rows first; they have already waited a full lease.
+            reclaimed = [row.id for row in session.execute(RECLAIM_EXPIRED_SQL, params)]
+            if reclaimed:
+                self.reclaimed_total += len(reclaimed)
+                logger.warning("reclaimed_expired_leases count=%s", len(reclaimed))
+            due = [row.id for row in session.execute(CLAIM_DUE_SQL, {**params, "limit": batch_size - len(reclaimed)})] if len(reclaimed) < batch_size else []
+            ids = reclaimed + due
+            if not ids:
+                return []
+            rows = session.execute(JOB_SQL, {"ids": ids}).all()
+            return [
+                ClaimedDelivery(
+                    id=row.id,
+                    tenant_id=row.tenant_id,
+                    channel=DeliveryChannel(row.channel),
+                    target_snapshot=row.target_snapshot,
+                    attempt_count=row.attempt_count,
+                    max_attempts=row.max_attempts,
+                    notification_id=row.notification_id,
+                    user_id=row.user_id,
+                    user_external_id=row.external_id,
+                    event_id=row.event_id,
+                    event_type=row.event_type,
+                    subject={"type": row.subject_type, "id": row.subject_id},
+                    payload=row.payload,
+                    occurred_at=row.occurred_at,
+                    webhook_active=row.webhook_active,
+                    webhook_secret_ciphertext=row.secret_ciphertext,
+                )
+                for row in rows
+            ]
+
+    def _apply(self, session, outcome: Outcome) -> bool:
+        """Fenced state transition + attempt row for one outcome.
+
+        The WHERE clause is the fence: attempt_count acts as a fencing token. If
+        our lease expired and another worker re-claimed the row, attempt_count
+        has moved on, zero rows match, and our late result is dropped.
+        """
+        claimed, failure = outcome.claimed, outcome.failure
+        if failure is None:
+            values = {"status": DeliveryStatus.delivered, "delivered_at": func.now(), "last_error_code": None}
+            attempt = {"outcome": "success", "provider_status_code": outcome.status_code}
+        else:
+            # The attempt row records what the provider said; the delivery status
+            # records our decision. "retryable_failure" + failed = retries exhausted.
             retry = failure.retryable and claimed.attempt_count < claimed.max_attempts
-            delivery.status = DeliveryStatus.pending if retry else DeliveryStatus.failed
-            delivery.next_attempt_at = now + timedelta(seconds=retry_delay_seconds(claimed.attempt_count)) if retry else delivery.next_attempt_at
-            delivery.failed_at = None if retry else now
-            delivery.lease_expires_at = None
-            delivery.last_error_code = str(failure.status_code or ("retryable_failure" if retry else "permanent_failure"))
-            session.add(DeliveryAttempt(tenant_id=delivery.tenant_id, delivery_id=delivery.id, attempt_number=claimed.attempt_count, started_at=now, completed_at=now, outcome="retryable_failure" if retry else "permanent_failure", provider_status_code=failure.status_code, provider_message=str(failure)[:512]))
-            return True
+            values = {"last_error_code": str(failure.status_code or ("retryable_failure" if failure.retryable else "permanent_failure"))}
+            if retry:
+                values.update(status=DeliveryStatus.pending, failed_at=None, next_attempt_at=func.now() + timedelta(seconds=retry_delay_seconds(claimed.attempt_count, failure.retry_after)))
+            else:
+                values.update(status=DeliveryStatus.failed, failed_at=func.now())
+            attempt = {"outcome": "retryable_failure" if failure.retryable else "permanent_failure", "provider_status_code": failure.status_code, "provider_message": str(failure)[:512]}
+
+        updated = session.execute(
+            update(Delivery)
+            .where(Delivery.id == claimed.id, Delivery.status == DeliveryStatus.processing, Delivery.attempt_count == claimed.attempt_count)
+            .values(lease_expires_at=None, updated_at=func.now(), **values)
+            .returning(Delivery.id)
+        ).first()
+        if not updated:
+            logger.warning("stale_completion_dropped delivery_id=%s attempt=%s", claimed.id, claimed.attempt_count)
+            return False
+        session.execute(insert(DeliveryAttempt).values(tenant_id=claimed.tenant_id, delivery_id=claimed.id, attempt_number=claimed.attempt_count, started_at=outcome.started_at, completed_at=outcome.completed_at, **attempt))
+        return True
+
+    def complete(self, outcomes: list[Outcome]) -> list[bool]:
+        """Record a whole batch in ONE transaction.
+
+        Measured: with a commit per delivery, PostgreSQL sessions spent most of
+        their time waiting on WALWrite/WALSync at COMMIT. One commit per batch
+        removes that ceiling. If the batch transaction fails for any reason we
+        fall back to a commit per outcome so one bad row cannot block the rest.
+        """
+        if not outcomes:
+            return []
+        try:
+            with SessionLocal.begin() as session:
+                return [self._apply(session, outcome) for outcome in outcomes]
+        except SQLAlchemyError:
+            logger.exception("batch_completion_failed size=%s; retrying one by one", len(outcomes))
+        results = []
+        for outcome in outcomes:
+            try:
+                with SessionLocal.begin() as session:
+                    results.append(self._apply(session, outcome))
+            except SQLAlchemyError:
+                # Left in processing; lease expiry will hand it to another attempt.
+                logger.exception("completion_failed delivery_id=%s", outcome.claimed.id)
+                results.append(False)
+        return results
+
+    def complete_success(self, claimed: ClaimedDelivery, started_at: datetime | None = None, status_code: int | None = None) -> bool:
+        now = datetime.now(timezone.utc)
+        return self.complete([Outcome(claimed, started_at or now, now, status_code=status_code)])[0]
+
+    def complete_failure(self, claimed: ClaimedDelivery, failure: ProviderFailure, started_at: datetime | None = None) -> bool:
+        now = datetime.now(timezone.utc)
+        return self.complete([Outcome(claimed, started_at or now, now, failure=failure)])[0]
+
+    def attempt(self, claimed: ClaimedDelivery) -> Outcome:
+        """Call the provider. No database access here, by design."""
+        started_at = datetime.now(timezone.utc)
+        try:
+            status_code = self.providers[claimed.channel].send(claimed)
+            return Outcome(claimed, started_at, datetime.now(timezone.utc), status_code=status_code)
+        except ProviderFailure as failure:
+            return Outcome(claimed, started_at, datetime.now(timezone.utc), failure=failure)
+        except Exception:
+            # Bugs or unexpected library errors: retry rather than lose the message,
+            # and keep the exception detail in logs rather than in the attempt row.
+            logger.exception("provider_crashed delivery_id=%s channel=%s", claimed.id, claimed.channel.value)
+            return Outcome(claimed, started_at, datetime.now(timezone.utc), failure=ProviderFailure("internal provider error", retryable=True))
 
     def deliver(self, claimed: ClaimedDelivery) -> bool:
-        try:
-            if claimed.channel == DeliveryChannel.email:
-                self.email_provider.send(delivery_id=claimed.id, target=claimed.target_snapshot)
-            return self.complete_success(claimed)
-        except ProviderFailure as failure:
-            return self.complete_failure(claimed, failure)
-        except Exception as exc:
-            return self.complete_failure(claimed, ProviderFailure("provider error", retryable=True))
+        return self.complete([self.attempt(claimed)])[0]
 
-    def run_once(self, batch_size: int = 25) -> int:
+    def run_once(self, batch_size: int = 10, executor: ThreadPoolExecutor | None = None) -> int:
         claimed = self.claim(batch_size)
-        for delivery in claimed:
-            self.deliver(delivery)
+        if executor is None or len(claimed) <= 1:
+            outcomes = [self.attempt(delivery) for delivery in claimed]
+        else:
+            outcomes = list(executor.map(self.attempt, claimed))
+        self.complete(outcomes)
         return len(claimed)
+
+
+class GracefulExit:
+    """SIGTERM/SIGINT finish the in-flight batch; anything cut short is covered by lease reclaim."""
+
+    def __init__(self) -> None:
+        self.requested = False
+        signal.signal(signal.SIGTERM, self._request)
+        signal.signal(signal.SIGINT, self._request)
+
+    def _request(self, signum, frame) -> None:
+        logger.info("shutdown_requested signal=%s", signum)
+        self.requested = True
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the notification delivery worker")
     parser.add_argument("--once", action="store_true")
-    parser.add_argument("--batch-size", type=int, default=25)
+    parser.add_argument("--batch-size", type=int, default=10)
+    parser.add_argument("--concurrency", type=int, default=10)
+    parser.add_argument("--lease-seconds", type=int, default=60)
     parser.add_argument("--poll-seconds", type=float, default=1.0)
     args = parser.parse_args()
-    worker = DeliveryWorker()
-    while True:
-        processed = worker.run_once(args.batch_size)
-        if args.once:
-            return
-        if not processed:
-            time.sleep(args.poll_seconds)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+    worker = DeliveryWorker(lease_seconds=args.lease_seconds, concurrency=args.concurrency)
+    worker.check_lease_budget(args.batch_size)
+    stop = GracefulExit()
+    logger.info("worker_started batch_size=%s concurrency=%s lease_seconds=%s", args.batch_size, args.concurrency, args.lease_seconds)
+    with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+        while not stop.requested:
+            processed = worker.run_once(args.batch_size, executor)
+            if args.once:
+                return
+            if not processed:
+                time.sleep(args.poll_seconds)
+    logger.info("worker_stopped")
 
 
 if __name__ == "__main__":

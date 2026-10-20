@@ -1,4 +1,9 @@
-# Version 0 Database Design
+# Database Design
+
+Originally the V0 design; kept in sync with the implemented schema. The
+migrations in `alembic/versions/` are the source of truth for DDL. Where the
+implementation deviates from the reference DDL below, an "Implementation note"
+says how and why.
 
 ## Role of PostgreSQL
 
@@ -10,6 +15,16 @@ transaction, avoiding a premature database/broker dual write.
 Use PostgreSQL 16+, UTC `timestamptz`, and Alembic migrations. Prefer UUIDv7
 generated in the application for index locality; `gen_random_uuid()` is suitable
 for initial development. Never use ORM auto-create in a deployed environment.
+
+Implementation notes:
+- Migrations contain **frozen, explicit DDL**. The first versions called
+  `Base.metadata.create_all()`, which made old revisions depend on today's models
+  and broke fresh databases as soon as a table was added. CI runs
+  `upgrade head`, `downgrade base`, `upgrade head`, then `alembic check` to prove
+  models and migrations agree.
+- Notification IDs are generated in the application (`uuid4`) so the whole
+  fan-out is inserted in one batched flush. UUIDv7 remains the preferred upgrade
+  once the minimum Python version has `uuid.uuid7()` (3.14).
 
 ## Relationship model
 
@@ -88,7 +103,7 @@ CREATE TABLE users (
 CREATE TABLE webhook_endpoints (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id UUID NOT NULL REFERENCES tenants(id),
-  url TEXT NOT NULL CHECK (url ~ '^https://'),
+  url TEXT NOT NULL,  -- https + public-IP rule enforced in app (see note)
   secret_ciphertext BYTEA NOT NULL,
   active BOOLEAN NOT NULL DEFAULT true,
   is_default BOOLEAN NOT NULL DEFAULT false,
@@ -155,7 +170,7 @@ CREATE TABLE deliveries (
   CHECK (jsonb_typeof(target_snapshot) = 'object'),
   CHECK ((status <> 'delivered') OR delivered_at IS NOT NULL),
   CHECK ((status <> 'failed') OR failed_at IS NOT NULL),
-  CHECK ((channel <> 'webhook') OR webhook_endpoint_id IS NOT NULL),
+  CHECK ((channel <> 'webhook') OR webhook_endpoint_id IS NOT NULL OR status = 'suppressed'),
   CHECK ((channel = 'webhook') OR webhook_endpoint_id IS NULL)
 );
 
@@ -174,6 +189,19 @@ CREATE TABLE delivery_attempts (
   FOREIGN KEY (tenant_id, delivery_id) REFERENCES deliveries(tenant_id, id)
 );
 ```
+
+Implementation notes on the DDL above:
+- `webhook_endpoints.url` has no `https://` CHECK in the database. The rule lives in
+  `validate_webhook_url()` together with the stronger checks a regex cannot do
+  (no credentials, every resolved IP must be public), and it can be relaxed with
+  `WEBHOOK_ALLOW_PRIVATE_NETWORKS` so a local receiver works in development.
+- The webhook CHECK adds `OR status = 'suppressed'`: when a tenant has no active
+  default endpoint, a webhook delivery is recorded as suppressed with no endpoint,
+  instead of being impossible to record.
+- `secret_ciphertext` is Fernet-encrypted with `WEBHOOK_SECRET_ENCRYPTION_KEY`.
+- `'webhook'` was added to `delivery_channel` by a later migration. PostgreSQL
+  cannot use a new enum value in the transaction that added it, so that statement
+  runs in an autocommit block; enum values cannot be dropped on downgrade.
 
 `target_snapshot` records the minimum safe target at planning time. Changing a
 user email or endpoint later does not change audit history or redirect retries.
@@ -217,25 +245,42 @@ Claim a bounded batch with `FOR UPDATE SKIP LOCKED`, commit, call providers, the
 make a short completion transaction. Never hold a database transaction during a
 provider HTTP call.
 
+The original design used one claim query with
+`WHERE (pending AND due) OR (processing AND lease expired)`. `EXPLAIN` showed that
+the `OR` makes PostgreSQL BitmapOr both partial indexes, fetch and **sort every
+due row**, and only then apply `LIMIT`, so each claim cost O(backlog). The
+implementation runs two statements in one transaction, one per partial index.
+Each is an ordered index scan that stops after `:limit` unlocked rows:
+
 ```sql
-WITH due AS (
+-- 1) crashed workers' rows first (idx_deliveries_expired_lease), then
+-- 2) due rows to fill the batch (idx_deliveries_due)
+WITH picked AS (
   SELECT id FROM deliveries
-  WHERE (status = 'pending' AND next_attempt_at <= now())
-     OR (status = 'processing' AND lease_expires_at < now())
-  ORDER BY next_attempt_at, id
+  WHERE status = 'pending' AND next_attempt_at <= now()     -- or: 'processing' AND lease_expires_at < now()
+  ORDER BY next_attempt_at, id                              -- or: lease_expires_at, id
+  LIMIT :limit
   FOR UPDATE SKIP LOCKED
-  LIMIT :batch_size
 )
 UPDATE deliveries d
 SET status = 'processing', attempt_count = d.attempt_count + 1,
-    lease_expires_at = now() + interval '60 seconds', updated_at = now()
-FROM due WHERE d.id = due.id
-RETURNING d.*;
+    lease_expires_at = now() + make_interval(secs => :lease_seconds), updated_at = now()
+FROM picked WHERE d.id = picked.id
+RETURNING d.id;
 ```
 
-The completion transaction appends `delivery_attempts` and transitions the row to
-`delivered`, `pending` with future `next_attempt_at`, or `failed`. The provider
-call gap is why delivery is at-least-once and requires stable provider keys.
+All times come from the database's `now()`, so workers with skewed clocks never
+disagree about lease expiry.
+
+Completion appends `delivery_attempts` and moves each row to `delivered`,
+`pending` with a future `next_attempt_at`, or `failed`. Each row's `UPDATE` is
+**fenced**: `WHERE status = 'processing' AND attempt_count = <claimed attempt>`. A
+worker whose lease expired and was re-claimed matches zero rows, and its late
+result is dropped. Load testing showed one commit per delivery
+saturating the WAL-write lock, so a whole batch's outcomes are written in **one
+transaction**, falling back to one commit per outcome if the batch fails.
+The provider-call gap is why delivery is at-least-once and requires stable
+provider keys.
 
 ## State transitions
 
@@ -246,14 +291,25 @@ call gap is why delivery is at-least-once and requires stable provider keys.
 | `processing` | `pending` | Retryable error with attempts remaining. |
 | `processing` | `failed` | Permanent error or attempts exhausted. |
 | `pending` | `suppressed` | Target unavailable or preference blocks send. |
-| `processing` | `processing` | Expired lease is reclaimed and attempt count increases. |
+| `processing` | `processing` | Expired lease is reclaimed and attempt count increases (only while `attempt_count < max_attempts`). |
+| `processing` | `failed` | Lease expired with no attempts left (`last_error_code = 'worker_lost'`, poison-message guard). |
+
+Note that `suppressed` is decided at **planning time** (the delivery is inserted
+as suppressed), not by a worker transition. `delivery_attempts.outcome` records
+what the provider said. A `failed` delivery whose last attempt is
+`retryable_failure` means retries were exhausted.
 
 `delivered`, `failed`, and `suppressed` are terminal. Manual redrive is a future
 administrative feature and must preserve attempt history.
 
 ## Security, operations, and measurements
 
-- Store only a slow hash or verifier of API-key secrets; reveal a generated secret once.
+- Store only a hash or verifier of API-key secrets; reveal a generated secret once.
+  Implementation note: new keys use SHA-256, not a slow KDF. The secrets are 256
+  random bits, so brute force is infeasible even against a fast hash, and scrypt
+  measured 35 ms of CPU per request (about 28 req/s per core). Legacy scrypt hashes
+  still verify. Lookup is by the indexed public `key_prefix`; comparison
+  is constant-time.
 - Encrypt webhook secrets; never return, log, snapshot, or include them in errors.
 - Bound and redact provider diagnostics. Payloads may hold personal data, so logs,
   database access, retention, and deletion need an explicit policy before regulated use.
@@ -263,6 +319,16 @@ administrative feature and must preserve attempt history.
 Record ingestion latency, due queue depth, p50/p95/p99 delivery lag by channel,
 retry and terminal-failure rate by provider, and expired-lease recovery count.
 These measurements are the evidence for adding Redis, Kafka, or separate workers.
+`python -m app.scripts.stats` prints them (queue depth, waiting-on-backoff,
+in-flight, expired leases, oldest due age, per-channel lag p50/p95/p99, retry and
+terminal-failure rates). Results from the load test are in
+[benchmarks.md](benchmarks.md).
+
+`deliveries` is a churny queue table: every claim and completion updates a row,
+leaving dead tuples and dead partial-index entries (11,400 were observed on an
+empty queue after a load test). Before production, lower
+`autovacuum_vacuum_scale_factor` for this table rather than relying on the 20%
+default.
 
 ```sql
 SELECT channel, status, count(*)

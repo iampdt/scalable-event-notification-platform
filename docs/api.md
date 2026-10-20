@@ -1,4 +1,22 @@
-# Version 0 API Contract
+# API Contract
+
+Originally written as the V0 design contract. It is now kept in sync with the
+implemented V1.x API; "Implementation note" lines mark where the build deviated
+from the original design and why.
+
+| Endpoint | Role | Status |
+| --- | --- | --- |
+| `POST /v1/events` | producer or admin | Implemented |
+| `GET /v1/events/{id}` | any | Implemented |
+| `GET /v1/notifications` | any | Implemented |
+| `GET /v1/notifications/{id}` | any | Implemented |
+| `GET /v1/users/{user_id}/in-app-notifications` | any | Implemented |
+| `POST /v1/in-app-notifications/{delivery_id}/read` | any | Implemented |
+| `POST /v1/users` | admin | Implemented |
+| `POST/GET /v1/webhook-endpoints`, `PATCH /v1/webhook-endpoints/{id}` | admin | Implemented |
+| `GET /healthz` | none | Implemented (liveness only; not in OpenAPI schema) |
+
+Interactive docs are served by FastAPI at `/docs` while the API is running.
 
 ## Conventions
 
@@ -8,7 +26,13 @@
   to one tenant; clients never submit `tenant_id`.
 - Write endpoints reject unknown fields. Initial limits are 64 KiB payloads and
   100 recipients per event.
-- List results are newest-first and cursor-paginated. Cursors are opaque.
+- List results are newest-first and cursor-paginated. Cursors are opaque
+  (base64 of `(created_at, id)`; keyset, not OFFSET). A malformed
+  cursor is `400 validation_error`.
+- Every response carries `X-Request-Id` (echoed from the request or generated);
+  error bodies include the same value as `request_id`.
+- Roles: `producer` keys may ingest and read; `admin` keys may additionally call
+  the tenant administration endpoints. Producer keys get `403 forbidden` there.
 
 ## Error envelope
 
@@ -30,6 +54,7 @@
 | 403 | `forbidden` | Credential lacks the required role. |
 | 404 | `not_found` | Resource is absent in this tenant. |
 | 409 | `idempotency_conflict` | Key was reused with different normalized content. |
+| 409 | `conflict` | A concurrent admin write won (e.g. two endpoints made default at once); retry. |
 | 413 | `payload_too_large` | Body or payload exceeded a limit. |
 | 422 | `unprocessable` | JSON is valid but violates a domain rule. |
 | 429 | `rate_limited` | Future quota control; not implemented in V0.1. |
@@ -75,7 +100,7 @@ original event; using the key with changed content returns `409`.
 | `subject` | Required object; `type` and `id` are each 1–100 characters. |
 | `payload` | Required JSON object, maximum 64 KiB, and must not contain secrets. |
 | `recipients` | Required non-empty array of 1–100 distinct active tenant user UUIDs. |
-| `channels` | Non-empty unique values from `email`, `webhook`, `in_app`. A missing usable target produces a recorded suppression; it is never redirected. |
+| `channels` | Non-empty unique values from `email`, `webhook`, `in_app`. A missing usable target (user without email, tenant without an active default webhook) produces a recorded `suppressed` delivery; it is never redirected. |
 | `metadata` | Optional JSON object, maximum 8 KiB, for tracing only—not authorization or routing. |
 
 Response: `202 Accepted`
@@ -94,6 +119,11 @@ Response: `202 Accepted`
 
 `202` means the event and initial delivery work are durably committed. It does not
 mean a provider or recipient has accepted anything.
+
+A repeat with the same key and body returns `202` with the original `id` and
+counts. Two simultaneous requests with the same key are resolved by the database
+unique constraint: one creates, the other replays (or gets `409` if its body differs).
+An unknown or inactive recipient returns `422` and nothing is written.
 
 ## Read event status
 
@@ -116,8 +146,13 @@ mean a provider or recipient has accepted anything.
 
 `GET /v1/notifications?status=pending&limit=50&cursor=<opaque-cursor>`
 
-`status` is optional: `pending`, `processing`, `delivered`, `failed`, or
-`suppressed`. `limit` defaults to 50 and is at most 100.
+`status` is optional: `pending`, `processing`, `delivered`, or `failed`. `limit`
+defaults to 50 and is at most 100.
+
+Implementation note: the original contract also listed `suppressed`, but by the
+aggregation rule below a notification whose channels are all suppressed is
+`failed`, so a `suppressed` notification can never exist. Status is derived from
+deliveries on read, not stored.
 
 ```json
 {
@@ -146,19 +181,26 @@ failed or suppressed; otherwise it remains pending or processing.
   "user_id": "4b19534d-2440-4b73-889b-9f1d01c477aa",
   "status": "pending",
   "deliveries": [
-    {"id": "82017374-5ebd-47f2-9447-ffd6229fb05e", "channel": "email", "status": "delivered", "attempt_count": 1, "delivered_at": "2026-09-14T12:30:05Z"},
-    {"id": "17d414a6-ec52-4375-95ff-28a299e7411f", "channel": "in_app", "status": "pending", "attempt_count": 0, "next_attempt_at": "2026-09-14T12:30:00Z"}
-  ]
+    {"id": "82017374-5ebd-47f2-9447-ffd6229fb05e", "channel": "email", "status": "delivered", "attempt_count": 1, "next_attempt_at": null, "delivered_at": "2026-09-14T12:30:05Z", "failed_at": null, "last_error_code": null},
+    {"id": "17d414a6-ec52-4375-95ff-28a299e7411f", "channel": "webhook", "status": "pending", "attempt_count": 1, "next_attempt_at": "2026-09-14T12:30:35Z", "delivered_at": null, "failed_at": null, "last_error_code": "503"}
+  ],
+  "created_at": "2026-09-14T12:30:00Z"
 }
 ```
+
+`next_attempt_at` is only shown for pending deliveries. `last_error_code` is the
+provider status code (`503`, `550`) or `retryable_failure` / `permanent_failure`;
+provider response bodies are never exposed.
 
 ## In-app feed
 
 `GET /v1/users/{user_id}/in-app-notifications?unread_only=true&limit=50&cursor=<opaque-cursor>`
 
-Returns only `in_app` deliveries in the authenticated tenant. V0 authenticates a
-tenant rather than an individual end user, so the tenant-facing application must
-enforce whether its caller may read this `user_id`.
+Returns only `in_app` deliveries in the authenticated tenant that the worker has
+marked `delivered` (a planned-but-unprocessed item is not yet visible).
+An unknown or other-tenant `user_id` is `404`. V0 authenticates a tenant rather
+than an individual end user, so the tenant-facing application must enforce
+whether its caller may read this `user_id`.
 
 ```json
 {
@@ -167,6 +209,7 @@ enforce whether its caller may read this `user_id`.
       "delivery_id": "17d414a6-ec52-4375-95ff-28a299e7411f",
       "notification_id": "d1e58638-6f17-4d24-baaa-31f6948a4c21",
       "event_type": "order.paid",
+      "subject": {"type": "order", "id": "ord_123"},
       "payload": {"order_id": "ord_123", "amount": 4999, "currency": "INR"},
       "read_at": null,
       "created_at": "2026-09-14T12:30:00Z"
@@ -177,8 +220,9 @@ enforce whether its caller may read this `user_id`.
 ```
 
 `POST /v1/in-app-notifications/{delivery_id}/read` is idempotent and returns the
-in-app delivery with its `read_at` timestamp; a non-in-app or cross-tenant ID is
-`404`.
+feed item with its `read_at` timestamp; repeating it keeps the first `read_at`
+(`COALESCE(read_at, now())`). A non-in-app, not-yet-delivered, or cross-tenant ID
+is `404`.
 
 ## Tenant administration
 
@@ -187,9 +231,22 @@ credential; initial tenant/key bootstrap belongs to deployment, not this API.
 
 | Endpoint | Purpose | Key fields |
 | --- | --- | --- |
-| `POST /v1/users` | Register or update a recipient. | `external_id`, optional `email`, `active` |
-| `POST /v1/webhook-endpoints` | Register outbound destination. | `url`, `secret`, `active` |
-| `GET /v1/webhook-endpoints` | List destinations without secret material. | Pagination fields |
+| `POST /v1/users` | Register or update a recipient, keyed by `(tenant, external_id)`. `201` on create, `200` on update. | `external_id`, optional `email`, `active` |
+| `POST /v1/webhook-endpoints` | Register outbound destination. `201`. | `url`, optional `secret` (≥ 24 chars), `active` (default true), `is_default` (default true) |
+| `GET /v1/webhook-endpoints` | List destinations without secret material. | `limit`, `cursor` |
+| `PATCH /v1/webhook-endpoints/{id}` | Activate/deactivate or make default. | `active`, `is_default` |
+
+Webhook endpoint rules:
+- If `secret` is omitted the platform generates `whsec_…` and returns it **once**
+  in the create response. Secrets are stored encrypted and never returned again.
+- URL must be `https://`, contain no credentials, and resolve only to public IP
+  addresses (SSRF guard). `WEBHOOK_ALLOW_PRIVATE_NETWORKS=true` relaxes this for
+  local development. Rejections are `422`.
+- At most one active default per tenant (partial unique index); making an endpoint
+  default clears the previous one in the same transaction.
+- Deliveries use the tenant's active default endpoint at ingestion time. If an
+  endpoint is deactivated, its already-planned deliveries fail permanently rather
+  than being sent.
 
 Webhook body:
 
@@ -197,6 +254,8 @@ Webhook body:
 {
   "delivery_id": "82017374-5ebd-47f2-9447-ffd6229fb05e",
   "event_id": "76db480d-5d35-4c39-92fa-a9d8cc74be8c",
+  "notification_id": "d1e58638-6f17-4d24-baaa-31f6948a4c21",
+  "recipient": {"user_id": "4b19534d-2440-4b73-889b-9f1d01c477aa", "external_id": "ada"},
   "event_type": "order.paid",
   "subject": {"type": "order", "id": "ord_123"},
   "payload": {"order_id": "ord_123", "amount": 4999, "currency": "INR"},
@@ -204,10 +263,19 @@ Webhook body:
 }
 ```
 
+Implementation note: `notification_id` and `recipient` were added to the
+original body. A webhook delivery is created per recipient, so without them the
+receiver could not tell which user a delivery is for.
+
 Headers include `X-Notification-Delivery-Id`, `X-Notification-Timestamp`, and
 `X-Notification-Signature: v1=<hex-hmac-sha256>`. The HMAC covers the timestamp,
 a period, and exact body. Receivers should reject stale timestamps and deduplicate
-delivery IDs.
+delivery IDs. `app/scripts/webhook_receiver.py` is a working reference receiver.
+
+Response handling: `2xx` is success. `408`, `429`, `5xx`, timeouts and connection
+errors are retried with backoff (`Retry-After` is honoured when longer). Other
+`4xx` and any `3xx` are permanent — redirects are not followed so a receiver
+cannot bounce the worker to an internal address. Timeout is 10 s.
 
 ## Trade-offs
 
@@ -218,3 +286,5 @@ delivery IDs.
   uncertainty without coupling to provider details.
 - Provider response IDs and diagnostic bodies remain internal to avoid leaking
   sensitive data and binding consumers to a provider.
+- Tenant/key creation is not an API endpoint: minting credentials would require a
+  super-admin credential with the largest blast radius in the system.

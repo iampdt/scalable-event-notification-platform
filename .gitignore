@@ -19,8 +19,13 @@ credentials/
 *.credentials
 
 # Local Python virtual environment
-.pro001
+pro001/
+.venv/
 
 # Python bytecode caches
 __pycache__/
 *.py[cod]
+.pytest_cache/
+
+# Private interview notes: a separate private repo, never pushed here
+notes/
