@@ -10,18 +10,17 @@ from confluent_kafka import KafkaError
 from confluent_kafka.admin import AdminClient, NewTopic
 
 from app.config import kafka_bootstrap_servers
-from app.messaging import DELIVERY_TOPIC_PARTITIONS, DELIVERY_TOPIC_RETENTION_MS, delivery_topic
+from app.messaging import DEAD_LETTER_RETENTION_MS, DELIVERY_TOPIC_PARTITIONS, DELIVERY_TOPIC_RETENTION_MS, dead_letter_topic, delivery_topic
 
 
 def ensure_topics(replication_factor: int = 1) -> None:
     admin = AdminClient({"bootstrap.servers": kafka_bootstrap_servers()})
-    topic = NewTopic(
-        delivery_topic(),
-        num_partitions=DELIVERY_TOPIC_PARTITIONS,
-        replication_factor=replication_factor,
-        config={"retention.ms": str(DELIVERY_TOPIC_RETENTION_MS), "cleanup.policy": "delete"},
-    )
-    for name, future in admin.create_topics([topic], request_timeout=15).items():
+    topics = [
+        NewTopic(delivery_topic(), num_partitions=DELIVERY_TOPIC_PARTITIONS, replication_factor=replication_factor, config={"retention.ms": str(DELIVERY_TOPIC_RETENTION_MS), "cleanup.policy": "delete"}),
+        # Low volume by definition; one partition keeps it in arrival order for humans.
+        NewTopic(dead_letter_topic(), num_partitions=1, replication_factor=replication_factor, config={"retention.ms": str(DEAD_LETTER_RETENTION_MS), "cleanup.policy": "delete"}),
+    ]
+    for name, future in admin.create_topics(topics, request_timeout=15).items():
         try:
             future.result()
             print(f"created topic {name}")
