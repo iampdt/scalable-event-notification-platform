@@ -83,6 +83,69 @@ What pointed to each step:
 4. **Commit frequency is a resource.** Batch writes where the semantics allow it.
 5. **Queue tables churn.** Watch dead tuples and tune autovacuum per table.
 
+## Redis: before/after (plan step 2)
+
+Measured on 2026-10-20 with the same setup as above, the API running from a
+virtualenv, and Redis 7.4 in Docker. The baseline was recorded **before** any Redis code
+was written.
+
+### Database round trips per request (deterministic)
+
+`python -m benchmarks.query_count` counts SQL statements for a warm request.
+
+| Request | Before | New code, Redis off | New code, Redis on |
+| --- | --- | --- | --- |
+| Authenticated `GET /v1/events/{id}` | 3 (api_keys, tenants, events) | 2 (key+tenant join, events) | **1** (events) |
+| `POST /v1/events`, 1 recipient × 2 channels, with template | 9 | 8 | **6** |
+
+The 3 removed lookups (credential, tenant, templates) run on *every* ingest,
+regardless of payload size. They hit the shared database, which is the resource
+the worker benchmarks showed saturating first.
+
+### Ingest latency (1,000 events, 3 recipients × 2 channels, concurrency 20, two runs each)
+
+| Configuration | Throughput | p50 | p95 | p99 |
+| --- | --- | --- | --- | --- |
+| Before (baseline code) | 165–180 ev/s | 108–109 ms | 139–194 ms | 152–307 ms |
+| New code, `REDIS_URL` unset | 174–183 ev/s | 105–110 ms | 139–150 ms | 211–223 ms |
+| **New code, Redis on** | **197–211 ev/s** | **91–95 ms** | **117–134 ms** | 177–281 ms |
+
+About 15% more throughput and 13% lower p50. I had predicted almost no latency
+change, reasoning that local queries cost well under a millisecond and the API is
+CPU-bound in Python. The prediction was wrong: each skipped statement also skips
+SQLAlchemy ORM work and a session round trip, and that is CPU in the API process.
+
+### Cache hit rate, and why Redis's own number misleads
+
+Redis `INFO stats` during the Redis-on runs reported 4,964 hits and 1,036
+misses (83%). Isolating the cache (200 authenticated GETs, which skip the
+limiter) gave **199 hits, 1 miss (99.5%)**, with one cold miss per key. The ~1,000
+"misses" were the rate limiter: the load-test tenant's limit is effectively
+unlimited, so its GCRA key expires within microseconds and each request's `GET`
+misses by design. A server-wide hit rate mixes different key families; per-cache
+metrics are needed (planned for the observability step).
+
+### Rate limiter accuracy
+
+`--rate-limit N` gives the tenant `N`/s with burst `N`, then sends 1,000 events at
+concurrency 20. GCRA allows at most `burst + rate × elapsed`.
+
+| Limit | Duration | Accepted (202) | Rejected (429) | Allowed maximum |
+| --- | --- | --- | --- | --- |
+| 50/s | 3.18 s | 203 | 797 | 209 |
+| 20/s | 3.10 s | 81 | 919 | 82 |
+
+Never above the limit. Rejected requests are cheap (cached auth plus one Lua
+call, no database work), so the limiter also shields PostgreSQL from a noisy
+tenant.
+
+### Redis outage (Docker stack, live)
+
+20 events with Redis up, 20 with `docker compose stop redis`, 20 after restart:
+**60/60 accepted** (`202`). Average latency 22 → 13 → 11 ms (no timeout penalty
+while down), one `redis_unavailable … bypassing for 5.0s` log line, and every
+delivery completed.
+
 ## Reproducing
 
 Numbers vary by about ±20% between runs on a laptop (other processes, Docker VM

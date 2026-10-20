@@ -234,6 +234,18 @@ version produced it. In SQLAlchemy the column is `JSONB(none_as_null=True)`.
 Without that flag, Python `None` is stored as the JSON value `'null'` rather than
 SQL `NULL`, and the CHECK above rejects it. The constraint is what caught this bug.
 
+Per-tenant rate limits (added with Redis): `tenants.rate_limit_per_second
+NUMERIC` and `tenants.rate_limit_burst INTEGER`, both nullable (NULL = platform
+default) with `> 0` checks. The values are read with the credential and cached
+alongside it.
+
+Connection pool: each API or worker process holds up to `DB_POOL_SIZE +
+DB_MAX_OVERFLOW` connections (10 + 10 by default), with a 5 s `pool_timeout` so an
+exhausted pool fails fast instead of hanging requests for SQLAlchemy's default
+30 s. The sum across all processes must stay below PostgreSQL's
+`max_connections` (100 by default). Past roughly that many processes, put PgBouncer
+in front.
+
 `target_snapshot` records the minimum safe target at planning time. Changing a
 user email or endpoint later does not change audit history or redirect retries.
 Examples: email `{ "email": "..." }`; in-app `{ "user_id": "..." }`; webhook

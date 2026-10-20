@@ -27,7 +27,7 @@ Load-test evidence: docs/benchmarks.md.
 - Real email provider: SMTP adapter (Mailpit locally, any SMTP relay in production)
 
 ### Not doing
-- Row-level security, retention policy, rate limiting, Redis, Kafka,
+- Row-level security, retention policy, Kafka (until plan step 3),
   Kubernetes, subscriptions/preferences
 
 ## Milestones
@@ -112,10 +112,23 @@ schema invariants have tests.
 - [Deliberately not done] `/auth/register` + `/auth/login`: callers are tenant backends, so the credential is an API key, not a user password session
 - [Deliberately not done] `POST /notifications`: `POST /v1/events` already creates notifications; a second write path would duplicate idempotency and fan-out
 
+### Plan alignment, step 2 (Redis + performance)
+Done when: a measured baseline, at least one optimization, and a before/after
+comparison exist; rate limiting enforces per-tenant fairness; Redis failure is
+tested.
+- [Done] Baseline recorded first: round trips per request (deterministic) and load-test latency
+- [Done] Fail-open Redis client (50 ms timeouts, 5 s circuit breaker)
+- [Done] Cache-aside: credential records (60 s TTL) and active templates (negative caching, invalidated after commit)
+- [Done] Per-tenant GCRA rate limiting (atomic Lua, Redis clock), `429` + `Retry-After`, per-tenant overrides
+- [Done] Explicit DB pool sizing (`DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS`)
+- [Done] Before/after: ingest round trips 9 → 6, authenticated GET 3 → 1; ingest about 15% more throughput, p50 108 → 91–95 ms
+- [Done] Limiter accuracy under load (203 accepted vs 209 allowed); chaos check with Redis stopped mid-traffic
+- [Already done earlier] Cursor pagination, indexes justified by query plans
+
 ## Current focus
-Next from the plan: step 2, Redis (per-tenant rate limiting first, then template caching with hit-rate measurement).
+Next from the plan: step 3, Kafka via a transactional outbox (the Postgres queue measured about 1,600 deliveries/s against about 2,000/s for the worst-case fan-out).
 Other candidate next steps, in priority order:
-1. Per-tenant fairness / rate limiting (one tenant can currently fill the queue)
+1. Per-cache hit/miss metrics (Redis's server-wide hit rate mixes cache and limiter keys)
 2. Retention: time-partition `events`/`deliveries`/`delivery_attempts`
 3. Pin resolved IP for webhook connections (DNS-rebinding gap)
 4. Row-level security as defense in depth
