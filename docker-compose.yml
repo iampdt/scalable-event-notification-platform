@@ -1,5 +1,5 @@
 # Full local stack:   docker compose up -d --build
-# Infrastructure only (run API/worker from your venv):   docker compose up -d postgres mailpit redis
+# Infrastructure only (run API/worker from your venv):   docker compose up -d postgres mailpit redis kafka
 
 # API, worker, and migrations are one image run with different commands.
 x-app: &app
@@ -15,6 +15,8 @@ x-app: &app
     SMTP_PORT: "1025"
     EMAIL_FROM: notifications@example.test
     REDIS_URL: redis://redis:6379/0
+    KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    DISPATCH_MODE: kafka
 
 services:
   postgres:
@@ -54,6 +56,36 @@ services:
       timeout: 3s
       retries: 5
 
+  # Single-node Kafka in KRaft mode (no ZooKeeper). Two listeners: containers use
+  # kafka:29092, processes on the host use localhost:9092.
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: notification-kafka
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:29092,CONTROLLER://:29093,EXTERNAL://:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      # Topics are created explicitly (app.scripts.kafka_topics), never by a typo.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # Single broker: internal topics cannot be replicated. Production uses 3 / min ISR 2.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
   # Local SMTP sink for the real email adapter. SMTP on 1025, web inbox on 8025.
   mailpit:
     image: axllent/mailpit:v1.21
@@ -72,6 +104,14 @@ services:
       postgres:
         condition: service_healthy
 
+  # One-shot: create Kafka topics explicitly (broker auto-creation is off).
+  kafka-init:
+    <<: *app
+    command: ["python", "-m", "app.scripts.kafka_topics"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+
   api:
     <<: *app
     restart: unless-stopped
@@ -86,14 +126,30 @@ services:
       timeout: 5s
       retries: 5
 
-  worker:
+  # DISPATCH_MODE=kafka (set in x-app): the relay publishes the outbox, the worker
+  # consumes Kafka. For SKIP LOCKED polling instead, set DISPATCH_MODE=postgres,
+  # change the worker command to app.workers.delivery_worker, and drop the relay.
+  relay:
     <<: *app
-    command: ["python", "-m", "app.workers.delivery_worker"]
+    command: ["python", "-m", "app.workers.outbox_relay"]
     restart: unless-stopped
-    # SIGTERM lets the worker finish its in-flight batch; give it time to.
     stop_grace_period: 30s
     depends_on:
       migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.workers.kafka_consumer"]
+    restart: unless-stopped
+    # SIGTERM lets the worker finish its in-flight batch and leave the consumer group.
+    stop_grace_period: 30s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      kafka-init:
         condition: service_completed_successfully
 
 volumes:
