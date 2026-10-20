@@ -45,3 +45,25 @@ def smtp_settings() -> dict:
         "sender": os.getenv("EMAIL_FROM", "notifications@example.test"),
         "timeout": float(os.getenv("SMTP_TIMEOUT_SECONDS", "10")),
     }
+
+
+def redis_url() -> str | None:
+    """Unset means "run without Redis": no cache, no rate limiting. Redis is never required."""
+    return os.getenv("REDIS_URL") or None
+
+
+def cache_ttl_seconds() -> int:
+    return int(os.getenv("CACHE_TTL_SECONDS", "60"))
+
+
+def rate_limit_defaults() -> tuple[float, int]:
+    """Per-tenant ingestion limit: sustained events/second and burst size."""
+    return float(os.getenv("RATE_LIMIT_PER_SECOND", "50")), int(os.getenv("RATE_LIMIT_BURST", "100"))
+
+
+def db_pool_settings() -> dict:
+    return {
+        "pool_size": int(os.getenv("DB_POOL_SIZE", "10")),
+        "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "10")),
+        "pool_timeout": float(os.getenv("DB_POOL_TIMEOUT_SECONDS", "5")),
+    }

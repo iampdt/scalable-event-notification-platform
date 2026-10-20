@@ -61,6 +61,28 @@ def collect(session: Session, minutes: int = 60, tenant_id: uuid.UUID | None = N
     return {"queue": queue, "window_minutes": minutes, "by_channel": channels}
 
 
+def redis_stats() -> dict | None:
+    """Server-wide numbers. Note keyspace hit rate mixes cache lookups with
+    rate-limiter keys (which mostly miss by design), so it understates the cache."""
+    from app.cache import get_cache
+
+    cache = get_cache()
+    info = cache.call("info", lambda r: {**r.info("stats"), **r.info("memory")})
+    if info is None:
+        return None
+    count = lambda pattern: sum(1 for _ in cache.client.scan_iter(match=pattern, count=1000))
+    hits, misses = info["keyspace_hits"], info["keyspace_misses"]
+    return {
+        "keyspace_hits": hits,
+        "keyspace_misses": misses,
+        "keyspace_hit_rate": round(hits / (hits + misses), 4) if hits + misses else None,
+        "used_memory_human": info["used_memory_human"],
+        "cached_credentials": count("auth:*"),
+        "cached_template_sets": count("templates:*"),
+        "rate_limited_tenants_tracked": count("ratelimit:*"),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Print delivery queue health")
     parser.add_argument("--minutes", type=int, default=60)
@@ -68,7 +90,7 @@ def main() -> None:
     args = parser.parse_args()
     with SessionLocal() as session:
         tenant_id = session.scalar(text("SELECT id FROM tenants WHERE slug = :slug"), {"slug": args.tenant_slug}) if args.tenant_slug else None
-        print(json.dumps(collect(session, args.minutes, tenant_id), indent=2, default=float))
+        print(json.dumps({**collect(session, args.minutes, tenant_id), "redis": redis_stats()}, indent=2, default=float))
 
 
 if __name__ == "__main__":
