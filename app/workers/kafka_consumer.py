@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 
 from confluent_kafka import Consumer, KafkaError, KafkaException, Producer, TopicPartition
 
+from app import metrics
+from app.logging_config import configure_logging
 from app.messaging import consumer_config, dead_letter_topic, delivery_topic, parse_delivery_message, producer_config
 from app.workers.delivery_worker import DeliveryWorker, GracefulExit
 
@@ -82,6 +84,7 @@ def consume_once(consumer: Consumer, worker: DeliveryWorker, batch_size: int, ex
         return 0
     try:
         worker.process_ids(ids, executor)
+        metrics.KAFKA_MESSAGES.labels("processed").inc(len(ids))
         if poison:
             if dlq is None:
                 # Never commit past a poison message without parking it somewhere.
@@ -92,6 +95,7 @@ def consume_once(consumer: Consumer, worker: DeliveryWorker, batch_size: int, ex
                 # The DLQ copy isn't acknowledged: don't commit, or the poison
                 # message would be lost rather than parked.
                 raise RuntimeError("dead-letter publish not acknowledged")
+            metrics.KAFKA_MESSAGES.labels("poison").inc(len(poison))
     except Exception:
         logger.exception("batch_failed size=%s; rewinding for redelivery", len(data))
         rewind(consumer, data)
@@ -112,7 +116,8 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, default=50)
     parser.add_argument("--lease-seconds", type=int, default=60)
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    configure_logging("kafka-consumer")
+    metrics.start_worker_metrics_server()
 
     worker = DeliveryWorker(lease_seconds=args.lease_seconds, concurrency=args.concurrency)
     worker.check_lease_budget(args.batch_size)

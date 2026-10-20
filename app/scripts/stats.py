@@ -87,21 +87,14 @@ OUTBOX_SQL = text(
 
 
 def kafka_stats() -> dict | None:
-    """Consumer-group lag per partition: log-end offset minus committed offset."""
     try:
-        from confluent_kafka import Consumer, TopicPartition
+        from confluent_kafka import Consumer
 
-        from app.messaging import consumer_config, delivery_topic
+        from app.messaging import consumer_config, delivery_topic, group_lag
 
-        consumer = Consumer({**consumer_config(), "enable.auto.commit": False})
-        metadata = consumer.list_topics(delivery_topic(), timeout=3)
-        partitions = [TopicPartition(delivery_topic(), p) for p in metadata.topics[delivery_topic()].partitions]
-        committed = consumer.committed(partitions, timeout=5)
-        lag = {}
-        for tp in committed:
-            _, high = consumer.get_watermark_offsets(tp, timeout=3)
-            lag[tp.partition] = high - (tp.offset if tp.offset >= 0 else 0)
-        consumer.close()
+        client = Consumer({**consumer_config(), "enable.auto.commit": False})
+        lag = group_lag(client)
+        client.close()
         return {"topic": delivery_topic(), "total_lag": sum(lag.values()), "lag_by_partition": {p: n for p, n in sorted(lag.items()) if n}}
     except Exception as exc:  # stats must never crash on a missing broker
         return {"error": str(exc)}

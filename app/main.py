@@ -2,27 +2,57 @@
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, OperationalError
 
 from app.api import admin, dead_letters, feed
 from app.api.errors import ApiError, api_error_handler, error_body
 from app.api.routes import router
+from app.logging_config import configure_logging, request_id_var
+from app.metrics import HTTP_DURATION, HTTP_REQUESTS, QueueCollector, api_registry
 
+logger = logging.getLogger(__name__)
+access_logger = logging.getLogger("app.access")
 # 64 KiB payload + 8 KiB metadata + envelope. Rejecting on Content-Length avoids
 # reading a huge body; chunked bodies without it are still bounded by the
 # per-field validators after parsing.
-logger = logging.getLogger(__name__)
 MAX_REQUEST_BYTES = 80 * 1024
+UNINSTRUMENTED_PATHS = {"/metrics"}
+# Probes run every few seconds: counted in metrics, kept out of the access log.
+UNLOGGED_PATHS = {"/metrics", "/healthz", "/readyz"}
+_queue_collector_registered = False
+
+
+def route_template(request: Request) -> str:
+    """The matched route's template, never the raw path: /v1/events/{event_id}
+    is one series, while raw paths (or 404 scans) would be unbounded."""
+    route = request.scope.get("route")
+    return getattr(route, "path", None) or "unmatched"
+
+
+def metrics_response() -> Response:
+    global _queue_collector_registered
+    registry = api_registry()
+    if registry is not None:  # multiprocess: build per scrape, add the DB gauges once
+        registry.register(QueueCollector())
+    else:
+        registry = REGISTRY
+        if not _queue_collector_registered:
+            REGISTRY.register(QueueCollector())
+            _queue_collector_registered = True
+    return Response(generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
 REQUEST_ID_HEADER = "X-Request-Id"
 
 
 def create_app() -> FastAPI:
+    configure_logging("api")
     app = FastAPI(title="Notification Platform", version="1.1.0")
     app.add_exception_handler(ApiError, api_error_handler)
 
@@ -58,12 +88,34 @@ def create_app() -> FastAPI:
         return await call_next(request)
 
     @app.middleware("http")
-    async def request_id(request: Request, call_next):
-        # Registered last so it runs first: every response, errors included, carries an ID.
+    async def observe(request: Request, call_next):
+        # Registered last so it runs first: every response, errors included, gets a
+        # request id, a metrics sample, and one structured access-log line.
         request.state.request_id = request.headers.get(REQUEST_ID_HEADER) or str(uuid.uuid4())
-        response = await call_next(request)
-        response.headers[REQUEST_ID_HEADER] = request.state.request_id
-        return response
+        token = request_id_var.set(request.state.request_id)
+        started = time.perf_counter()
+        status = 500  # if call_next raises, the outer error handler answers 500
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            response.headers[REQUEST_ID_HEADER] = request.state.request_id
+            return response
+        finally:
+            elapsed = time.perf_counter() - started
+            route = route_template(request)
+            if request.url.path not in UNINSTRUMENTED_PATHS:
+                HTTP_REQUESTS.labels(request.method, route, str(status)).inc()
+                HTTP_DURATION.labels(request.method, route).observe(elapsed)
+            if request.url.path not in UNLOGGED_PATHS:
+                access_logger.info(
+                    "request",
+                    extra={"method": request.method, "route": route, "status": status, "duration_ms": round(elapsed * 1000, 1), "tenant_id": getattr(request.state, "tenant_id", None)},
+                )
+            request_id_var.reset(token)
+
+    @app.get("/metrics", include_in_schema=False)
+    def metrics() -> Response:
+        return metrics_response()
 
     @app.get("/healthz", include_in_schema=False)
     def healthz() -> dict:

@@ -30,9 +30,11 @@ from confluent_kafka import KafkaException, Producer
 from sqlalchemy import insert, text
 from sqlalchemy.exc import OperationalError
 
+from app import metrics
 from app.db.models import OutboxMessage
+from app.logging_config import configure_logging
 from app.db.session import SessionLocal
-from app.messaging import delivery_message, producer_config
+from app.messaging import delivery_message, group_lag, producer_config
 from app.workers.delivery_worker import FAIL_ABANDONED_SQL, Backoff, GracefulExit
 
 logger = logging.getLogger(__name__)
@@ -88,6 +90,7 @@ class OutboxRelay:
         self.producer = producer or Producer(producer_config())
         self.batch_size = batch_size
         self.flush_timeout = flush_timeout
+        self._lag_client = None
 
     def publish_batch(self) -> tuple[int, int]:
         """Publish up to batch_size due rows. Returns (published, failed)."""
@@ -120,6 +123,8 @@ class OutboxRelay:
             if acked:
                 session.execute(DELETE_SQL, {"ids": list(acked)})
             failed = [row for row in rows if row.id not in acked]
+            metrics.OUTBOX_PUBLISHED.inc(len(acked))
+            metrics.OUTBOX_PUBLISH_FAILURES.inc(len(failed))
             for row in failed:
                 session.execute(BACKOFF_SQL, {"id": row.id, "error": errors.get(row.id, "no delivery report before flush timeout")[:500]})
             if failed:
@@ -132,11 +137,28 @@ class OutboxRelay:
             abandoned = session.execute(FAIL_ABANDONED_SQL, {"limit": limit}).all()
             if abandoned:
                 logger.error("abandoned_deliveries_failed count=%s ids=%s", len(abandoned), [str(row.id) for row in abandoned])
+                for row in abandoned:
+                    metrics.DELIVERIES_DEAD_LETTERED.labels(str(row.channel), "worker_lost").inc()
             expired = session.execute(REQUEUE_EXPIRED_SQL, {"limit": limit}).all()
             if expired:
                 session.execute(insert(OutboxMessage), [delivery_message(row.id, row.tenant_id) for row in expired])
                 logger.warning("requeued_expired_leases count=%s", len(expired))
+                metrics.LEASES_RECLAIMED.inc(len(expired))
             return len(abandoned), len(expired)
+
+    def record_consumer_lag(self) -> None:
+        """Export consumer-group lag from outside the consumers (see messaging.group_lag)."""
+        try:
+            if self._lag_client is None:
+                from confluent_kafka import Consumer
+
+                from app.messaging import consumer_config
+
+                self._lag_client = Consumer({**consumer_config(), "enable.auto.commit": False})
+            for partition, lag in group_lag(self._lag_client).items():
+                metrics.KAFKA_CONSUMER_LAG.labels(str(partition)).set(lag)
+        except Exception as exc:  # noqa: BLE001 - metrics must never stop publishing
+            logger.debug("consumer_lag_unavailable %s", exc)
 
     def backfill(self) -> int:
         """One-off, e.g. after switching DISPATCH_MODE to kafka: enqueue pending rows with no outbox row."""
@@ -154,7 +176,8 @@ def main() -> None:
     parser.add_argument("--sweep-seconds", type=float, default=10.0)
     parser.add_argument("--backfill", action="store_true")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    configure_logging("outbox-relay")
+    metrics.start_worker_metrics_server()
 
     relay = OutboxRelay(batch_size=args.batch_size)
     if args.backfill:
@@ -169,6 +192,7 @@ def main() -> None:
             published, failed = relay.publish_batch()
             if time.monotonic() >= next_sweep:
                 relay.sweep()
+                relay.record_consumer_lag()
                 next_sweep = time.monotonic() + args.sweep_seconds
         except OperationalError as exc:
             backoff.failed("database", exc)
