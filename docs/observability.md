@@ -158,3 +158,16 @@ With `LOG_FORMAT=json` (set in Compose), every line is one JSON object:
 3. **"Ingestion is slow."** Look at `POST /v1/events` p95, then `/readyz`, then
    host CPU and the database. The scale experiments in [benchmarks.md](benchmarks.md)
    show what saturates first.
+
+## Troubleshooting
+
+**Grafana shows "Failed to load home dashboard" (HTTP 500) after switching git
+branches.** The `observability/` directories are bind-mounted. If git deletes and
+recreates them (checking out a branch without them, then coming back), the
+running container keeps pointing at the old, deleted directory and sees it as
+empty. Grafana stays up, but finds no dashboard. Recreate the containers so they
+mount the current directory:
+
+```sh
+docker compose up -d --force-recreate grafana prometheus
+```
