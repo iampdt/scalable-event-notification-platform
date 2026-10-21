@@ -93,7 +93,7 @@ each skipped query also skips ORM work, and the API was CPU-bound.
 
 Redis's `INFO` reported an **83%** hit rate; isolating the cache gave **99.5%**.
 Rate-limiter keys, which miss by design, were mixed into the server-wide
-counter. Every Redis call fails open behind a 50 ms timeout and a circuit
+counter. Every Redis call fails open behind a short socket timeout and a circuit
 breaker. With Redis stopped mid-traffic, 60 of 60 requests were accepted with no
 latency increase.
 
@@ -169,6 +169,13 @@ cross-checked every metric against SQL ground truth once:
 - **Consumer lag vanished when consumers were idle, or dead.** Lag is now
   measured by the relay from outside the group. With every consumer stopped it
   read 1,800 and stayed visible.
+- **The dashboard caught Redis "outages" that weren't outages.** Under load the
+  Redis client tripped its breaker three times on a healthy Redis. The 50 ms
+  socket timeout sat inside normal jitter: Redis's own probe showed 40 ms spikes
+  from Docker VM scheduling, and a timeout measured in a busy Python process also
+  counts time spent waiting for the GIL. Raising it to 250 ms (now configurable)
+  gave zero timeouts under the same load. Set timeouts from the measured tail,
+  not a guess.
 - **`uvicorn --workers 2` halved every counter**, because each scrape saw one
   process. That's what `PROMETHEUS_MULTIPROC_DIR` is for.
 

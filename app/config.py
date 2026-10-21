@@ -52,6 +52,12 @@ def redis_url() -> str | None:
     return os.getenv("REDIS_URL") or None
 
 
+def redis_timeout_seconds() -> float:
+    """Socket timeout for every Redis call. Must sit above the environment's *tail*
+    latency: 50 ms (the first value) tripped on a healthy Redis under load."""
+    return float(os.getenv("REDIS_TIMEOUT_SECONDS", "0.25"))
+
+
 def cache_ttl_seconds() -> int:
     return int(os.getenv("CACHE_TTL_SECONDS", "60"))
 

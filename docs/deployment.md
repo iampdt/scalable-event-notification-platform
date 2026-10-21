@@ -67,6 +67,7 @@ Downgrades exist but can't remove PostgreSQL enum values (`'webhook'`).
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USERNAME` / `SMTP_PASSWORD` / `SMTP_STARTTLS` / `SMTP_TIMEOUT_SECONDS` | localhost / 1025 / — / — / false / 10 | Your relay, e.g. SES on 587 with `SMTP_STARTTLS=true` |
 | `EMAIL_FROM` | `notifications@example.test` | A verified sender domain (SPF, DKIM, DMARC) |
 | `REDIS_URL` | unset (no Redis) | Optional. Unset disables the cache, rate limits and circuit breakers |
+| `REDIS_TIMEOUT_SECONDS` | 0.25 | Above Redis's measured *tail* latency in your environment; 50 ms tripped on a healthy Redis under load |
 | `CACHE_TTL_SECONDS` | 60 | Also the worst-case delay for a key revoked directly in SQL |
 | `RATE_LIMIT_PER_SECOND` / `RATE_LIMIT_BURST` | 50 / 100 | Per-tenant overrides: `tenants.rate_limit_per_second/_burst` |
 | `CIRCUIT_FAILURE_THRESHOLD` / `CIRCUIT_COOLDOWN_SECONDS` / `CIRCUIT_MAX_COOLDOWN_SECONDS` | 5 / 30 / 300 | — |

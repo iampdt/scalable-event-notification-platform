@@ -117,7 +117,7 @@ Done when: a measured baseline, at least one optimization, and a before/after
 comparison exist; rate limiting enforces per-tenant fairness; Redis failure is
 tested.
 - [Done] Baseline recorded first: round trips per request (deterministic) and load-test latency
-- [Done] Fail-open Redis client (50 ms timeouts, 5 s circuit breaker)
+- [Done] Fail-open Redis client (socket timeouts, 5 s circuit breaker; timeout raised from 50 to 250 ms after the dashboard showed it tripping on a healthy Redis)
 - [Done] Cache-aside: credential records (60 s TTL) and active templates (negative caching, invalidated after commit)
 - [Done] Per-tenant GCRA rate limiting (atomic Lua, Redis clock), `429` + `Retry-After`, per-tenant overrides
 - [Done] Explicit DB pool sizing (`DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS`)

@@ -198,7 +198,7 @@ impossible at the schema level, and cross-tenant lookups return `404` rather tha
 | Rate limiter (`ratelimit:ingest:{tenant}`) | One GCRA timestamp per tenant | **Fail open**: requests are allowed |
 | `last_used_at` throttle (`lastused:{key}`) | Marker key | Falls back to comparing the stored timestamp |
 
-Mechanics: 50 ms socket timeouts bound added latency, and a circuit breaker skips
+Mechanics: socket timeouts (`REDIS_TIMEOUT_SECONDS`, default 250 ms) bound added latency, and a circuit breaker skips
 Redis for 5 s after a failure, so an outage costs one timeout per process, not
 one per request. Verified live: with Redis stopped mid-traffic, 60 of 60 events
 were accepted with no latency increase, and one `redis_unavailable` log line.
