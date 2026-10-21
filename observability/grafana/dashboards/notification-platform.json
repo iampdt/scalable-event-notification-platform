@@ -93,6 +93,8 @@
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
+          "min": 0,
+          "max": 1,
           "custom": {
             "stacking": {
               "mode": "none"
@@ -1115,6 +1117,8 @@
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
+          "min": 0,
+          "max": 1,
           "custom": {
             "stacking": {
               "mode": "none"

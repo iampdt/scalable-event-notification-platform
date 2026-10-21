@@ -95,6 +95,15 @@ targets would multiply them.
 
 ## Dashboard
 
+![Grafana dashboard during two load waves: requests, ingest latency, attempts, end-to-end latency, queue depth draining, consumer lag, cache hit ratio](images/grafana-dashboard.png)
+
+*Two waves of 2,000 events × 3 recipients × 2 channels through the Docker stack
+(Kafka mode). The queue fills and drains each wave (the oldest due delivery peaks
+at about 20 s), consumer lag spikes and clears, and there are no 5xx, dead letters,
+or circuit trips. The "Redis outages" panel opens at 2 because its 5-minute window
+still counts the timeouts that led to raising the Redis socket timeout (see
+[failure-experiments.md](failure-experiments.md#bugs-these-experiments-and-their-tests-found)).*
+
 `observability/build_dashboard.py` generates
 `observability/grafana/dashboards/notification-platform.json`: dashboards as
 code, so edit the script, not the UI. The 23 panels are grouped in six rows:
@@ -158,3 +167,16 @@ With `LOG_FORMAT=json` (set in Compose), every line is one JSON object:
 3. **"Ingestion is slow."** Look at `POST /v1/events` p95, then `/readyz`, then
    host CPU and the database. The scale experiments in [benchmarks.md](benchmarks.md)
    show what saturates first.
+
+## Troubleshooting
+
+**Grafana shows "Failed to load home dashboard" (HTTP 500) after switching git
+branches.** The `observability/` directories are bind-mounted. If git deletes and
+recreates them (checking out a branch without them, then coming back), the
+running container keeps pointing at the old, deleted directory and sees it as
+empty. Grafana stays up, but finds no dashboard. Recreate the containers so they
+mount the current directory:
+
+```sh
+docker compose up -d --force-recreate grafana prometheus
+```

@@ -4,7 +4,12 @@ PostgreSQL is the source of truth; Redis only makes things faster (cache) or
 fairer (rate limits). So every Redis failure degrades to "no cache / no limit"
 instead of an error:
 
-- Tight socket timeouts (50 ms) bound how much latency a sick Redis can add.
+- Socket timeouts (REDIS_TIMEOUT_SECONDS, default 250 ms) bound how much
+  latency a sick Redis can add. The first value, 50 ms, was a guess, and it
+  tripped on a *healthy* Redis under load. Redis's own latency probe showed
+  40 ms spikes from Docker VM scheduling, and a timeout measured inside a busy
+  Python process also counts time spent waiting for the GIL. Set timeouts from
+  the measured tail, not the median.
 - A small circuit breaker: after a failure, skip Redis entirely for a cool-off
   period, so an outage costs one timeout per process, not one per request.
 """
@@ -17,7 +22,7 @@ import time
 
 import redis
 
-from app.config import redis_url
+from app.config import redis_timeout_seconds, redis_url
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +30,8 @@ COOL_OFF_SECONDS = 5.0
 
 
 class Cache:
-    def __init__(self, url: str | None, timeout: float = 0.05):
+    def __init__(self, url: str | None, timeout: float | None = None):
+        timeout = redis_timeout_seconds() if timeout is None else timeout
         self.client = redis.Redis.from_url(url, socket_timeout=timeout, socket_connect_timeout=timeout, decode_responses=True) if url else None
         self._down_until = 0.0
         self._lock = threading.Lock()

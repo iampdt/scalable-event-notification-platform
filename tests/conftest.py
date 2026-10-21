@@ -24,3 +24,15 @@ def pytest_sessionstart(session):
     from alembic.config import Config
 
     command.upgrade(Config("alembic.ini"), "head")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """In CI every service is provided, so a skipped test means lost coverage
+    (e.g. Kafka unreachable makes the Kafka tests skip themselves). Fail instead."""
+    if os.getenv("CI_REQUIRE_ALL_TESTS") != "1":
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    skipped = len(reporter.stats.get("skipped", [])) if reporter else 0
+    if skipped:
+        reporter.write_line(f"CI_REQUIRE_ALL_TESTS: {skipped} test(s) were skipped; failing the run.", red=True)
+        session.exitstatus = 1

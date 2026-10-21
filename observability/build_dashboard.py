@@ -22,7 +22,8 @@ def panel(title: str, targets: list[dict], unit: str = "short", description: str
         "description": description,
         "datasource": DS,
         "targets": targets,
-        "fieldConfig": {"defaults": {"unit": unit, "custom": {"stacking": {"mode": "normal" if stack else "none"}, "fillOpacity": 15 if stack else 5}}, "overrides": []},
+        # Ratios get a fixed 0-1 axis: an all-zero series otherwise auto-scales to "10000%".
+        "fieldConfig": {"defaults": {"unit": unit, **({"min": 0, "max": 1} if unit == "percentunit" else {}), "custom": {"stacking": {"mode": "normal" if stack else "none"}, "fillOpacity": 15 if stack else 5}}, "overrides": []},
         "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
     }
 

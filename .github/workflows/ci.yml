@@ -52,6 +52,8 @@ jobs:
       EMAIL_PROVIDER: fake
       TEST_REDIS_URL: redis://localhost:6379/15
       TEST_KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+      # Every service is provided here, so any skipped test is lost coverage: fail.
+      CI_REQUIRE_ALL_TESTS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -64,7 +66,7 @@ jobs:
       - run: alembic upgrade head
       - run: alembic downgrade base && alembic upgrade head
       - run: alembic check
-      - run: pytest -q
+      - run: pytest -q -rs
 
   docker:
     runs-on: ubuntu-latest

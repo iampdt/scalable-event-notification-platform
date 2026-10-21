@@ -140,6 +140,7 @@ Consumer lag afterwards was **0**: the partition wasn't blocked.
 | Relay crash-looped on a DB outage | Stopping Postgres | In-process exponential backoff in the relay and polling worker |
 | `consume_once(dlq=None)` logged a poison message and committed past it, so it was lost | DLQ test | Never commit a poison message without a DLQ producer; seek back instead |
 | Experiment contaminated by leftover rows | Worker log during the breaker experiment | Retire leftovers; require an empty queue |
+| Redis client failed open on a *healthy* Redis under load (3 timeouts in 30 min) | The Grafana "Redis outages" panel during a load test | The 50 ms socket timeout was inside Docker/GIL jitter (40 ms spikes measured); now `REDIS_TIMEOUT_SECONDS`, default 250 ms: zero timeouts under the same load |
 
 ## Automated coverage
 

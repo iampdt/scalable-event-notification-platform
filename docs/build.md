@@ -117,7 +117,7 @@ Done when: a measured baseline, at least one optimization, and a before/after
 comparison exist; rate limiting enforces per-tenant fairness; Redis failure is
 tested.
 - [Done] Baseline recorded first: round trips per request (deterministic) and load-test latency
-- [Done] Fail-open Redis client (50 ms timeouts, 5 s circuit breaker)
+- [Done] Fail-open Redis client (socket timeouts, 5 s circuit breaker; timeout raised from 50 to 250 ms after the dashboard showed it tripping on a healthy Redis)
 - [Done] Cache-aside: credential records (60 s TTL) and active templates (negative caching, invalidated after commit)
 - [Done] Per-tenant GCRA rate limiting (atomic Lua, Redis clock), `429` + `Retry-After`, per-tenant overrides
 - [Done] Explicit DB pool sizing (`DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS`)
@@ -163,14 +163,25 @@ through metrics, logs and dashboards.
 - [Done] API horizontal scaling 1/2/4 processes (138–155 → 213–229 ev/s; host CPU saturated); multiprocess metrics verified
 - [Not done] Observability screenshots for the README (needs a browser capture: open Grafana during a load test)
 
+### Plan alignment, step 6 (portfolio and production-style polish)
+Done when: the plan's V6 deliverables exist and the project can be explained at
+four depths.
+- [Done] README rewritten for a reader in a hurry: results at a glance, CI badge, docs map, one-command demo
+- [Done] Engineering write-up (docs/engineering-writeup.md): bottlenecks, experiments, wrong predictions, lessons
+- [Done] Deployment guide (docs/deployment.md): topology, release process, configuration reference, sizing, checklist
+- [Done] Narrated end-to-end demo (scripts/demo.sh) and a VHS tape that renders the GIF
+- [Done] CI fails on any skipped test (all services are provided there)
+- [Already done] Architecture diagram, API docs, Compose, CI, test suite, benchmark report, failure report, decision records (kept in private notes)
+- [Needs a human] Record the GIF (`vhs scripts/demo.tape`) and Grafana screenshots during a load test
+
 ## Current focus
-Next from the plan: step 6, portfolio polish (deployment instructions, demo GIF/screenshots, public engineering write-up, interview prep at 30 s / 2 min / 10 min / 30 min).
-Other candidate next steps, in priority order:
-1. Per-cache hit/miss metrics (Redis's server-wide hit rate mixes cache and limiter keys)
+All six plan versions are implemented. Candidate next work, in priority order:
+1. Fair delivery scheduling across tenants (ingestion is rate limited; the queue is FIFO)
 2. Retention: time-partition `events`/`deliveries`/`delivery_attempts`
-3. Pin resolved IP for webhook connections (DNS-rebinding gap)
-4. Row-level security as defense in depth
-5. Manual redrive endpoint for failed deliveries (keeps attempt history)
+3. Lease heartbeats (crash recovery of in-flight work takes about 70 s today)
+4. Pin the resolved IP for webhook connections (DNS-rebinding gap)
+5. Row-level security as defense in depth
+6. Scaling measurements on separate hosts (one laptop saturates first)
 
 ## Open questions
 - Should webhook retries run longer than ~1.2 h for receivers that are down for a long time (with circuit breaking)?
