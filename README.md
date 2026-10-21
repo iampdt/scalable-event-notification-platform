@@ -11,6 +11,10 @@ It's built learning-first: every component had to earn its place, and every
 performance claim was measured, including the ones that turned out wrong. The
 story is in **[the engineering write-up](docs/engineering-writeup.md)**.
 
+![Demo: one event delivered by email, signed webhook and in-app; idempotent replay and 409; a 410 in the dead-letter queue; per-tenant rate limiting; matching metrics](docs/demo.gif)
+
+*The demo above is [`scripts/demo.sh`](scripts/demo.sh) running against the Docker stack, recorded with `vhs scripts/demo.tape`.*
+
 **Stack:** Python 3.12, FastAPI, PostgreSQL 16 (source of truth *and* job
 queue), Redis (optional, fail-open), Kafka (optional dispatch through a
 transactional outbox), Prometheus, Grafana, Docker Compose, GitHub Actions.
@@ -65,8 +69,9 @@ All numbers were measured on one 8-core laptop; method and caveats are in [bench
 - **Templates:** logic-free `{{ payload.field }}` (no SSTI surface), rendered at
   ingestion, so a missing field is a `422` up front.
 - **Operable:** Prometheus metrics (RED plus pipeline saturation, consumer lag
-  measured from outside the group), 10 alert rules, a Grafana dashboard as code,
-  JSON logs keyed by `request_id`, `/healthz` vs `/readyz`.
+  measured from outside the group), 10 alert rules, a Grafana dashboard as code
+  ([screenshot](docs/images/grafana-dashboard.png)), JSON logs keyed by
+  `request_id`, `/healthz` vs `/readyz`.
 - **Tested:** 137 tests against real PostgreSQL, Redis and Kafka in CI. CI fails if
   any test is skipped, and checks migrations from scratch, the downgrade path, and
   model drift.
