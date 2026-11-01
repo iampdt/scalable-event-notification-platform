@@ -241,7 +241,7 @@ sequenceDiagram
   participant R as Outbox relay
   participant K as Kafka
   participant C as Consumer (group)
-  API->>PG: BEGIN; event + deliveries + outbox rows; COMMIT
+  API->>PG: BEGIN; event and deliveries + outbox rows; COMMIT
   API-->>API: 202
   R->>PG: lock due outbox rows (SKIP LOCKED)
   R->>K: produce (acks=all, idempotent)
