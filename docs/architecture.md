@@ -242,18 +242,24 @@ sequenceDiagram
     participant K as Kafka
     participant C as Consumer (group)
 
-    API->>PG: BEGIN; insert event, deliveries and outbox rows; COMMIT
-    API-->>API: 202 Accepted
+    API->>PG: BEGIN
+    API->>PG: Insert event and delivery records
+    API->>PG: Insert outbox records
+    API->>PG: COMMIT
+    API-->>API: Return 202 Accepted
 
     R->>PG: Lock due outbox rows (SKIP LOCKED)
-    R->>K: Produce (acks=all, idempotent)
-    K-->>R: Acknowledgements
-    R->>PG: Delete acknowledged rows; COMMIT
+    R->>K: Produce message (acks=all, idempotent)
+    K-->>R: Acknowledgement
+    R->>PG: Delete acknowledged rows
+    R->>PG: COMMIT
 
     C->>K: Consume batch
-    C->>PG: UPDATE deliveries WHERE id = ANY(ids) AND status = pending (fenced claim)
+    C->>PG: Claim pending deliveries by ID (fenced update)
     C->>C: Send via providers (no transaction)
-    C->>PG: Record outcomes and create outbox rows for each retry; COMMIT
+    C->>PG: Record delivery outcomes
+    C->>PG: Create outbox records for retries
+    C->>PG: COMMIT
     C->>K: Commit offsets
 ```
 
