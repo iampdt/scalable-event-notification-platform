@@ -236,22 +236,25 @@ PostgreSQL stays the system of record. See [benchmarks.md](benchmarks.md#kafka-v
 
 ```mermaid
 sequenceDiagram
-  participant API
-  participant PG as PostgreSQL
-  participant R as Outbox relay
-  participant K as Kafka
-  participant C as Consumer (group)
-  API->>PG: BEGIN; event and deliveries and outbox rows; COMMIT
-  API-->>API: 202
-  R->>PG: lock due outbox rows (SKIP LOCKED)
-  R->>K: produce (acks=all, idempotent)
-  K-->>R: acks
-  R->>PG: delete acked rows; COMMIT
-  C->>K: consume batch
-  C->>PG: UPDATE … WHERE id = ANY(ids) AND status='pending' (fenced claim)
-  C->>C: send via providers (no transaction)
-  C->>PG: record outcomes (+ outbox row for each retry); COMMIT
-  C->>K: commit offsets
+    participant API
+    participant PG as PostgreSQL
+    participant R as Outbox relay
+    participant K as Kafka
+    participant C as Consumer (group)
+
+    API->>PG: BEGIN; insert event, deliveries and outbox rows; COMMIT
+    API-->>API: 202 Accepted
+
+    R->>PG: Lock due outbox rows (SKIP LOCKED)
+    R->>K: Produce (acks=all, idempotent)
+    K-->>R: Acknowledgements
+    R->>PG: Delete acknowledged rows; COMMIT
+
+    C->>K: Consume batch
+    C->>PG: UPDATE deliveries WHERE id = ANY(ids) AND status = pending (fenced claim)
+    C->>C: Send via providers (no transaction)
+    C->>PG: Record outcomes and create outbox rows for each retry; COMMIT
+    C->>K: Commit offsets
 ```
 
 | Concern | Design |
